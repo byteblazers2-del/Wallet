@@ -6,6 +6,7 @@ import com.example.core.keystore.AuthGate
 import com.example.core.keystore.SecureKeyStore
 import com.example.core.keystore.VaultAuthRequiredException
 import com.example.core.keystore.VaultKeyInvalidatedException
+import com.example.core.keystore.VaultPinLockedOutException
 import com.example.core.keystore.VaultWrongPinException
 import com.example.core.model.AccountOnChainStatus
 import com.example.core.model.AuthReason
@@ -150,7 +151,6 @@ class WalletCoreImpl(
   private val authGate: AuthGate,
   private val secureKeyStore: SecureKeyStore = SecureKeyStore(applicationContext),
   private val metadataStore: VaultMetadataStore = VaultMetadataStore(applicationContext),
-  private val walletKitBridge: WalletKitBridge? = WalletKitBridge(applicationContext, secureKeyStore),
   private val balanceRepository: BalanceRepository? = null,
   private val txManager: TxManager? = null,
   private val devSkipAuth: Boolean = false,
@@ -186,6 +186,10 @@ class WalletCoreImpl(
   }
 
   override suspend fun createWallet(initialNetwork: Network, appPin: CharArray?): Result<NewWallet> {
+    if (initialNetwork != Network.MAINNET) {
+      appPin?.let { Arrays.fill(it, '\u0000') }
+      return Result.failure(VaultException("GramVault supports Mainnet only"))
+    }
     val targetMode =
       when {
         devSkipAuth -> VaultSecurityMode.DEV_UNAUTH_KEYSTORE
@@ -211,9 +215,9 @@ class WalletCoreImpl(
         }
       }
       VaultSecurityMode.APP_PIN_WITH_KEYSTORE -> {
-        if (appPin == null || appPin.size < 4) {
+        if (!SecureKeyStore.isValidPinFormat(appPin)) {
           appPin?.let { Arrays.fill(it, '\u0000') }
-          return Result.failure(VaultException("Set a 4 to 8 digit App PIN to protect your wallet"))
+          return Result.failure(VaultException("Set a 6 to 8 digit App PIN to protect your wallet"))
         }
       }
     }
@@ -251,12 +255,10 @@ class WalletCoreImpl(
           )
         withContext(Dispatchers.IO) { metadataStore.save(meta) }
 
-        val synced = syncWalletKit(meta, initialNetwork)
         _vaultState.value =
           VaultState.Unlocked(
             metadata = meta,
             activeNetwork = initialNetwork,
-            walletKitSynced = synced,
           )
         NewWallet(
           mainnetAddress = mainnetAddr,
@@ -308,6 +310,10 @@ class WalletCoreImpl(
     initialNetwork: Network,
     appPin: CharArray?,
   ): Result<VaultMetadata> {
+    if (initialNetwork != Network.MAINNET) {
+      appPin?.let { Arrays.fill(it, '\u0000') }
+      return Result.failure(VaultException("GramVault supports Mainnet only"))
+    }
     val targetMode =
       when {
         devSkipAuth -> VaultSecurityMode.DEV_UNAUTH_KEYSTORE
@@ -333,9 +339,9 @@ class WalletCoreImpl(
         }
       }
       VaultSecurityMode.APP_PIN_WITH_KEYSTORE -> {
-        if (appPin == null || appPin.size < 4) {
+        if (!SecureKeyStore.isValidPinFormat(appPin)) {
           appPin?.let { Arrays.fill(it, '\u0000') }
-          return Result.failure(VaultException("Set a 4 to 8 digit App PIN to protect your wallet"))
+          return Result.failure(VaultException("Set a 6 to 8 digit App PIN to protect your wallet"))
         }
       }
     }
@@ -374,12 +380,10 @@ class WalletCoreImpl(
           )
         withContext(Dispatchers.IO) { metadataStore.save(meta) }
 
-        val synced = syncWalletKit(meta, initialNetwork)
         _vaultState.value =
           VaultState.Unlocked(
             metadata = meta,
             activeNetwork = initialNetwork,
-            walletKitSynced = synced,
           )
         meta
       } finally {
@@ -391,6 +395,10 @@ class WalletCoreImpl(
   }
 
   override suspend fun unlockWallet(network: Network, appPin: CharArray?): Result<VaultMetadata> {
+    if (network != Network.MAINNET) {
+      appPin?.let { Arrays.fill(it, '\u0000') }
+      return Result.failure(VaultException("GramVault supports Mainnet only"))
+    }
     val currentMeta = metadataStore.load()
     if (currentMeta == null) {
       appPin?.let { Arrays.fill(it, '\u0000') }
@@ -414,9 +422,12 @@ class WalletCoreImpl(
         }
       }
       VaultSecurityMode.APP_PIN_WITH_KEYSTORE -> {
-        if (appPin == null || appPin.size < 4) {
-          appPin?.let { Arrays.fill(it, '\u0000') }
+        if (appPin == null) {
           return Result.failure(VaultAuthRequiredException())
+        }
+        if (!SecureKeyStore.isValidPinFormat(appPin)) {
+          Arrays.fill(appPin, '\u0000')
+          return Result.failure(VaultException("Wallet PIN must be 6 to 8 digits"))
         }
       }
     }
@@ -437,17 +448,17 @@ class WalletCoreImpl(
           }
         }
       require(derivedPubHex == currentMeta.publicKeyHex) { "Key mismatch detected in vault" }
-      val synced = syncWalletKit(currentMeta, network)
       _vaultState.value =
         VaultState.Unlocked(
           metadata = currentMeta,
           activeNetwork = network,
-          walletKitSynced = synced,
         )
       cleanupScope.launch { txManager?.recoverPendingTransactions(currentMeta.addressFor(network)) }
       Result.success(currentMeta)
     } catch (e: VaultKeyInvalidatedException) {
       _vaultState.value = VaultState.KeyInvalidated(currentMeta)
+      Result.failure(e)
+    } catch (e: VaultPinLockedOutException) {
       Result.failure(e)
     } catch (e: VaultWrongPinException) {
       Result.failure(e)
@@ -484,9 +495,12 @@ class WalletCoreImpl(
         }
       }
       VaultSecurityMode.APP_PIN_WITH_KEYSTORE -> {
-        if (appPin == null || appPin.size < 4) {
-          appPin?.let { Arrays.fill(it, '\u0000') }
+        if (appPin == null) {
           return Result.failure(VaultAuthRequiredException())
+        }
+        if (!SecureKeyStore.isValidPinFormat(appPin)) {
+          Arrays.fill(appPin, '\u0000')
+          return Result.failure(VaultException("Wallet PIN must be 6 to 8 digits"))
         }
       }
     }
@@ -537,6 +551,11 @@ class WalletCoreImpl(
     }
     val useAppPin = current.metadata.securityMode == VaultSecurityMode.APP_PIN_WITH_KEYSTORE
     val requireUserAuth = current.metadata.securityMode != VaultSecurityMode.DEV_UNAUTH_KEYSTORE
+    if (useAppPin && appPin != null && !SecureKeyStore.isValidPinFormat(appPin)) {
+      answers.values.forEach { a -> Arrays.fill(a, '\u0000') }
+      Arrays.fill(appPin, '\u0000')
+      return Result.failure(VaultException("Wallet PIN must be 6 to 8 digits"))
+    }
 
     return try {
       val passed =
@@ -599,24 +618,25 @@ class WalletCoreImpl(
   }
 
   override suspend fun switchNetwork(network: Network) {
+    if (network != Network.MAINNET) return
     val current = _vaultState.value as? VaultState.Unlocked ?: return
     val updatedMeta =
-      if (current.metadata.lastActiveNetwork != network) {
-        current.metadata.copy(lastActiveNetwork = network).also { meta ->
+      if (current.metadata.lastActiveNetwork != Network.MAINNET) {
+        current.metadata.copy(lastActiveNetwork = Network.MAINNET).also { meta ->
           withContext(Dispatchers.IO) { metadataStore.save(meta) }
         }
       } else {
         current.metadata
       }
-    if (current.activeNetwork == network && current.walletKitSynced) {
+    if (current.activeNetwork == Network.MAINNET) {
       if (updatedMeta != current.metadata) {
         _vaultState.value = current.copy(metadata = updatedMeta)
       }
       return
     }
-    val synced = syncWalletKit(updatedMeta, network)
-    _vaultState.value = current.copy(metadata = updatedMeta, activeNetwork = network, walletKitSynced = synced)
-    cleanupScope.launch { txManager?.recoverPendingTransactions(updatedMeta.addressFor(network)) }
+    _vaultState.value =
+      current.copy(metadata = updatedMeta, activeNetwork = Network.MAINNET)
+    cleanupScope.launch { txManager?.recoverPendingTransactions(updatedMeta.addressFor(Network.MAINNET)) }
   }
 
   override fun lockWallet() {
@@ -724,7 +744,13 @@ class WalletCoreImpl(
     }
     val validAddress = checked as AddressCheckResult.Valid
 
-    val usdtSpec = if (assetKind == TxAssetKind.JETTON) JettonAllowList.usdtFor(activeNetwork) else null
+    val usdtSpec =
+      if (assetKind == TxAssetKind.JETTON) {
+        JettonAllowList.usdtFor(activeNetwork)
+          ?: return Result.failure(VaultException("USDT is only supported on Mainnet"))
+      } else {
+        null
+      }
     val expectedDecimals = usdtSpec?.decimals ?: GRAM_DECIMALS
     val symbolLabel = usdtSpec?.symbol ?: "GRAM"
 
@@ -936,9 +962,12 @@ class WalletCoreImpl(
         }
       }
       VaultSecurityMode.APP_PIN_WITH_KEYSTORE -> {
-        if (appPin == null || appPin.size < 4) {
-          appPin?.let { Arrays.fill(it, '\u0000') }
+        if (appPin == null) {
           return Result.failure(VaultAuthRequiredException())
+        }
+        if (!SecureKeyStore.isValidPinFormat(appPin)) {
+          Arrays.fill(appPin, '\u0000')
+          return Result.failure(VaultException("Wallet PIN must be 6 to 8 digits"))
         }
       }
     }
@@ -1053,8 +1082,7 @@ class WalletCoreImpl(
   override suspend fun refreshTransactionStatus(txId: String): TxRecord? =
     txManager?.refreshTransactionStatus(txId)
 
-  override fun preferredNetwork(): Network =
-    metadataStore.load()?.lastActiveNetwork ?: Network.MAINNET
+  override fun preferredNetwork(): Network = Network.MAINNET
 
   override suspend fun syncTransactionHistory(
     limit: Int,
@@ -1077,24 +1105,5 @@ class WalletCoreImpl(
     return ByteArray(clean.length / 2) { i ->
       clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
     }
-  }
-
-  private suspend fun syncWalletKit(metadata: VaultMetadata, network: Network): Boolean {
-    val bridge = walletKitBridge ?: return false
-    val useAppPin = metadata.securityMode == VaultSecurityMode.APP_PIN_WITH_KEYSTORE
-    val requireUserAuth = metadata.securityMode != VaultSecurityMode.DEV_UNAUTH_KEYSTORE
-    return runCatching {
-        val kitAddr =
-          bridge.attachWallet(
-            publicKeyHex = metadata.publicKeyHex,
-            network = network,
-            walletVersion = metadata.walletVersion,
-            useAppPinMode = useAppPin,
-            requireUserAuth = requireUserAuth,
-          ) ?: return false
-        val expectedAddr = metadata.addressFor(network)
-        kitAddr.raw == expectedAddr.raw
-      }
-      .getOrDefault(false)
   }
 }

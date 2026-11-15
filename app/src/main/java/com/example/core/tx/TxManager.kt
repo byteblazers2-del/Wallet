@@ -113,8 +113,12 @@ class TxManager(
 
   suspend fun fetchJettonChainContext(
     senderAddress: TonAddress,
-  ): Result<RemoteJettonBalance> =
-    chainGateway.fetchJettonBalance(senderAddress, JettonAllowList.usdtFor(senderAddress.network))
+  ): Result<RemoteJettonBalance> {
+    val spec =
+      JettonAllowList.usdtFor(senderAddress.network)
+        ?: return Result.failure(IllegalArgumentException("USDT is only supported on Mainnet"))
+    return chainGateway.fetchJettonBalance(senderAddress, spec)
+  }
 
   suspend fun estimateTransferFee(
     senderAddress: TonAddress,
@@ -288,9 +292,11 @@ class TxManager(
 
     val usdtSpec = JettonAllowList.usdtFor(accountAddress.network)
     val jettonPage =
-      chainGateway
-        .fetchJettonHistory(accountAddress, usdtSpec, limit = limit)
-        .getOrNull()
+      usdtSpec?.let { spec ->
+        chainGateway
+          .fetchJettonHistory(accountAddress, spec, limit = limit)
+          .getOrNull()
+      }
 
     if (page.transfers.isEmpty() && (jettonPage == null || jettonPage.transfers.isEmpty())) {
       return Result.success(
@@ -332,23 +338,60 @@ class TxManager(
             existingByMsgHash.direction == TxDirection.OUT.name &&
               transfer.direction == TxDirection.OUT
           ) {
-            val updatedEntity =
-              existingByMsgHash.copy(
-                txHash = transfer.txHash,
-                lt = transfer.lt,
-                feeUnits = transfer.fee?.units?.toString() ?: existingByMsgHash.feeUnits,
-                state = terminalStatus.name,
-                bocBase64 = null,
-                updatedAtEpochMs = nowMs,
-                errorDetail =
-                  if (terminalStatus == TxStatus.FAILED) {
-                    existingByMsgHash.errorDetail ?: "Transaction aborted on-chain"
-                  } else {
-                    null
-                  },
-              )
-            toUpsert.add(updatedEntity)
-            reconciledCount++
+            if (existingByMsgHash.kind == TxAssetKind.JETTON.name) {
+              // Wallet-contract history only proves the first hop left the sender wallet;
+              // never mark a Jetton transfer CONFIRMED from wallet history alone.
+              if (terminalStatus == TxStatus.FAILED) {
+                val updatedEntity =
+                  existingByMsgHash.copy(
+                    txHash = transfer.txHash,
+                    lt = transfer.lt,
+                    feeUnits = transfer.fee?.units?.toString() ?: existingByMsgHash.feeUnits,
+                    state = TxStatus.FAILED.name,
+                    bocBase64 = null,
+                    updatedAtEpochMs = nowMs,
+                    errorDetail = existingByMsgHash.errorDetail ?: "Transaction aborted on-chain",
+                  )
+                toUpsert.add(updatedEntity)
+                reconciledCount++
+              } else if (
+                existingByMsgHash.state == TxStatus.SIGNED.name ||
+                  existingByMsgHash.txHash == null ||
+                  existingByMsgHash.lt == null
+              ) {
+                val nextState =
+                  if (existingByMsgHash.state == TxStatus.SIGNED.name) TxStatus.BROADCASTED.name
+                  else existingByMsgHash.state
+                toUpsert.add(
+                  existingByMsgHash.copy(
+                    txHash = existingByMsgHash.txHash ?: transfer.txHash,
+                    lt = existingByMsgHash.lt ?: transfer.lt,
+                    feeUnits = transfer.fee?.units?.toString() ?: existingByMsgHash.feeUnits,
+                    state = nextState,
+                    bocBase64 = null,
+                    updatedAtEpochMs = nowMs,
+                  )
+                )
+              }
+            } else {
+              val updatedEntity =
+                existingByMsgHash.copy(
+                  txHash = transfer.txHash,
+                  lt = transfer.lt,
+                  feeUnits = transfer.fee?.units?.toString() ?: existingByMsgHash.feeUnits,
+                  state = terminalStatus.name,
+                  bocBase64 = null,
+                  updatedAtEpochMs = nowMs,
+                  errorDetail =
+                    if (terminalStatus == TxStatus.FAILED) {
+                      existingByMsgHash.errorDetail ?: "Transaction aborted on-chain"
+                    } else {
+                      null
+                    },
+                )
+              toUpsert.add(updatedEntity)
+              reconciledCount++
+            }
           } else if (
             existingByMsgHash.direction == TxDirection.IN.name &&
               transfer.direction == TxDirection.IN &&
@@ -545,15 +588,25 @@ class TxManager(
     val nowMs = clockMs()
     val nowEpochSec = nowMs / 1000L
 
-    // 1. Check message inclusion/execution status on-chain first.
+    // 1. Check message/trace inclusion and execution status on-chain first.
     val lookup =
-      chainGateway
-        .lookupMessageStatus(
-          network = network,
-          messageHashHex = entity.messageHash,
-          normalizedHashHex = entity.normalizedHash,
-        )
-        .getOrNull()
+      if (entity.kind == TxAssetKind.JETTON.name) {
+        chainGateway
+          .lookupJettonTraceStatus(
+            network = network,
+            messageHashHex = entity.messageHash,
+            normalizedHashHex = entity.normalizedHash,
+          )
+          .getOrNull()
+      } else {
+        chainGateway
+          .lookupMessageStatus(
+            network = network,
+            messageHashHex = entity.messageHash,
+            normalizedHashHex = entity.normalizedHash,
+          )
+          .getOrNull()
+      }
 
     if (lookup != null) {
       when (lookup.status) {
@@ -591,33 +644,16 @@ class TxManager(
     val walletInfo = chainGateway.fetchWalletInfo(accountAddress).getOrNull()
     if (walletInfo != null) {
       if (walletInfo.seqno > entity.seqno) {
-        // Seqno advanced: if we already broadcasted this tx and message lookup is lagging, give
-        // indexer a short window after valid_until, otherwise confirm seqno consumption once safe.
-        if (
-          currentStatus == TxStatus.BROADCASTED &&
-            nowEpochSec >= (entity.createdAtEpochMs / 1000L) + SEQNO_CONFIRM_LAG_SECONDS
-        ) {
-          txDao.markTerminal(
+        // Seqno advanced without on-chain hash confirmation: never mark CONFIRMED or EXPIRED
+        // from seqno alone. Move to UNCERTAIN, clear any stored BOC so it never rebroadcasts,
+        // and keep checking by message hash.
+        if (currentStatus != TxStatus.UNCERTAIN || entity.bocBase64 != null) {
+          txDao.updateLifecycleState(
             id = entity.id,
-            finalState = TxStatus.CONFIRMED.name,
-            txHash = lookup?.txHash,
-            lt = lookup?.lt,
-            feeUnits = lookup?.fee?.units?.toString(),
+            newState = TxStatus.UNCERTAIN.name,
+            bocBase64 = null,
             updatedAtEpochMs = nowMs,
-            errorDetail = null,
-          )
-          balanceRepository?.refreshBalance(accountAddress, force = true)
-          return txDao.getById(entity.id) ?: entity
-        }
-        if (currentStatus != TxStatus.BROADCASTED && nowEpochSec > entity.validUntilEpochSec + EXPIRY_GRACE_SECONDS) {
-          txDao.markTerminal(
-            id = entity.id,
-            finalState = TxStatus.EXPIRED.name,
-            txHash = null,
-            lt = null,
-            feeUnits = null,
-            updatedAtEpochMs = nowMs,
-            errorDetail = "Sequence number was used before broadcast completed",
+            errorDetail = "Sequence number advanced before message hash confirmation; verifying on TON",
           )
           return txDao.getById(entity.id) ?: entity
         }
@@ -626,6 +662,19 @@ class TxManager(
 
       // walletInfo.seqno <= entity.seqno
       if (nowEpochSec > entity.validUntilEpochSec + EXPIRY_GRACE_SECONDS) {
+        if (currentStatus == TxStatus.BROADCASTED || currentStatus == TxStatus.UNCERTAIN) {
+          if (currentStatus != TxStatus.UNCERTAIN || entity.bocBase64 != null) {
+            txDao.updateLifecycleState(
+              id = entity.id,
+              newState = TxStatus.UNCERTAIN.name,
+              bocBase64 = null,
+              updatedAtEpochMs = nowMs,
+              errorDetail = "Validity window passed while awaiting message hash confirmation; verifying on TON",
+            )
+            return txDao.getById(entity.id) ?: entity
+          }
+          return entity
+        }
         txDao.markTerminal(
           id = entity.id,
           finalState = TxStatus.EXPIRED.name,
@@ -633,7 +682,7 @@ class TxManager(
           lt = null,
           feeUnits = null,
           updatedAtEpochMs = nowMs,
-          errorDetail = "Transaction validity window expired before execution",
+          errorDetail = "Transaction validity window expired before broadcast",
         )
         return txDao.getById(entity.id) ?: entity
       }
@@ -729,7 +778,6 @@ class TxManager(
 
   companion object {
     const val EXPIRY_GRACE_SECONDS = 15L
-    private const val SEQNO_CONFIRM_LAG_SECONDS = 8L
     private const val POLL_INTERVAL_MS = 3500L
     private const val MAX_POLL_ATTEMPTS = 45
   }

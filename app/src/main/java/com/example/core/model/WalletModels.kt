@@ -123,6 +123,5 @@ sealed interface VaultState {
   data class Unlocked(
     val metadata: VaultMetadata,
     val activeNetwork: Network,
-    val walletKitSynced: Boolean,
   ) : VaultState
 }

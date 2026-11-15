@@ -319,7 +319,7 @@ fun PinPromptDialog(
     confirmButton = {
       Button(
         onClick = {
-          if (pin.length < 4 || pin.length > 8) {
+          if (pin.length < 6 || pin.length > 8) {
             localError = lengthError
           } else if (isSetupMode && pin != confirmPin) {
             localError = mismatchError

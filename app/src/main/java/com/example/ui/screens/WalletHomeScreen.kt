@@ -116,8 +116,6 @@ import com.example.ui.components.TonkeeperActionCircle
 import com.example.ui.components.VaultGlassCard
 import com.example.ui.components.tactileClickable
 import com.example.ui.theme.JetBrainsMonoFontFamily
-import com.example.ui.theme.TestnetBannerOnRed
-import com.example.ui.theme.TestnetBannerRed
 import com.example.ui.theme.UsdtGreen
 import com.example.ui.theme.VaultBlue
 import com.example.ui.theme.VaultDarkCard
@@ -132,10 +130,9 @@ import kotlinx.coroutines.launch
 @Composable
 fun WalletHomeScreen(
   metadata: VaultMetadata,
-  activeNetwork: Network,
+  activeNetwork: Network = Network.MAINNET,
   bannerMessage: String?,
   onClearBanner: () -> Unit,
-  onSelectNetwork: (Network) -> Unit,
   onOpenBackup: () -> Unit,
   onLockWallet: () -> Unit,
   balanceState: BalanceState = BalanceState(),
@@ -208,8 +205,6 @@ fun WalletHomeScreen(
     topBar = {
       WalletTopBar(
         walletVersionLabel = stringResource(R.string.wallet_badge_format, metadata.walletVersion.displayName),
-        activeNetwork = activeNetwork,
-        onSelectNetwork = onSelectNetwork,
         onLockWallet = onLockWallet,
       )
     },
@@ -278,7 +273,6 @@ fun WalletHomeScreen(
           }
 
           HeroBalanceCard(
-            activeNetwork = activeNetwork,
             friendlyAddress = friendlyAddress,
             isBackedUp = metadata.isBackedUp,
             balanceState = balanceState,
@@ -314,7 +308,6 @@ fun WalletHomeScreen(
 
           ChainMonitorCard(
             monitorState = monitorState,
-            activeNetwork = activeNetwork,
             onToggleMonitor = onToggleMonitor,
             onSyncNow = onSyncNow,
           )
@@ -392,33 +385,9 @@ fun WalletHomeScreen(
 @Composable
 private fun WalletTopBar(
   walletVersionLabel: String,
-  activeNetwork: Network,
-  onSelectNetwork: (Network) -> Unit,
   onLockWallet: () -> Unit,
 ) {
   Column(modifier = Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars)) {
-    AnimatedVisibility(
-      visible = activeNetwork == Network.TESTNET,
-      enter = expandVertically() + fadeIn(),
-      exit = shrinkVertically() + fadeOut(),
-    ) {
-      Box(
-        modifier =
-          Modifier.fillMaxWidth()
-            .background(TestnetBannerRed)
-            .padding(vertical = 6.dp)
-            .testTag("testnet_banner"),
-        contentAlignment = Alignment.Center,
-      ) {
-        Text(
-          text = stringResource(R.string.testnet_active_warning),
-          color = TestnetBannerOnRed,
-          style = MaterialTheme.typography.labelMedium,
-          fontWeight = FontWeight.Bold,
-        )
-      }
-    }
-
     Row(
       modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
       horizontalArrangement = Arrangement.SpaceBetween,
@@ -459,7 +428,7 @@ private fun WalletTopBar(
 
       Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
       ) {
         IconButton(
           onClick = onLockWallet,
@@ -471,81 +440,27 @@ private fun WalletTopBar(
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
           )
         }
-        NetworkTogglePill(activeNetwork = activeNetwork, onSelectNetwork = onSelectNetwork)
+        Surface(
+          shape = RoundedCornerShape(999.dp),
+          color = VaultBlue.copy(alpha = 0.16f),
+          border = BorderStroke(1.dp, VaultBlue.copy(alpha = 0.32f)),
+          modifier = Modifier.testTag("network_mainnet_badge"),
+        ) {
+          Text(
+            text = stringResource(R.string.network_mainnet),
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+            color = VaultBlue,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+          )
+        }
       }
     }
   }
 }
 
 @Composable
-private fun NetworkTogglePill(activeNetwork: Network, onSelectNetwork: (Network) -> Unit) {
-  Surface(
-    shape = RoundedCornerShape(999.dp),
-    color = VaultDarkCard,
-    border = BorderStroke(1.dp, VaultHairlineBorder),
-    modifier = Modifier.testTag("network_toggle_pill"),
-  ) {
-    Row(modifier = Modifier.padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-      NetworkChip(
-        label = stringResource(R.string.network_mainnet),
-        selected = activeNetwork == Network.MAINNET,
-        selectedColor = VaultBlue,
-        tag = "network_mainnet_button",
-        onClick = { onSelectNetwork(Network.MAINNET) },
-      )
-      NetworkChip(
-        label = stringResource(R.string.network_testnet),
-        selected = activeNetwork == Network.TESTNET,
-        selectedColor = TestnetBannerRed,
-        tag = "network_testnet_button",
-        onClick = { onSelectNetwork(Network.TESTNET) },
-      )
-    }
-  }
-}
-
-@Composable
-private fun NetworkChip(
-  label: String,
-  selected: Boolean,
-  selectedColor: Color,
-  tag: String,
-  onClick: () -> Unit,
-) {
-  val bgColor by
-    animateColorAsState(
-      targetValue = if (selected) selectedColor else Color.Transparent,
-      animationSpec = tween(220),
-      label = "networkChipBg",
-    )
-  val textColor by
-    animateColorAsState(
-      targetValue = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
-      animationSpec = tween(220),
-      label = "networkChipText",
-    )
-  Box(
-    modifier =
-      Modifier.clip(RoundedCornerShape(999.dp))
-        .background(bgColor)
-        .tactileClickable(onClick = onClick)
-        .minimumInteractiveComponentSize()
-        .padding(horizontal = 12.dp, vertical = 6.dp)
-        .testTag(tag),
-    contentAlignment = Alignment.Center,
-  ) {
-    Text(
-      text = label,
-      style = MaterialTheme.typography.labelMedium,
-      fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-      color = textColor,
-    )
-  }
-}
-
-@Composable
 private fun HeroBalanceCard(
-  activeNetwork: Network,
   friendlyAddress: String,
   isBackedUp: Boolean,
   balanceState: BalanceState,
@@ -560,7 +475,6 @@ private fun HeroBalanceCard(
       balanceState.isLoading -> stringResource(R.string.wallet_balance_loading)
       else -> stringResource(R.string.wallet_balance_unavailable)
     }
-  val glowColor = if (activeNetwork == Network.MAINNET) VaultBlue else TestnetBannerRed
 
   VaultGlassCard(
     modifier = Modifier.fillMaxWidth().testTag("wallet_hero_card"),
@@ -574,7 +488,7 @@ private fun HeroBalanceCard(
             drawCircle(
               brush =
                 Brush.radialGradient(
-                  colors = listOf(glowColor.copy(alpha = 0.22f), Color.Transparent),
+                  colors = listOf(VaultBlue.copy(alpha = 0.22f), Color.Transparent),
                   center = Offset(size.width * 0.5f, size.height * 0.15f),
                   radius = size.width * 0.65f,
                 ),
@@ -596,11 +510,9 @@ private fun HeroBalanceCard(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
           ) {
             Text(
-              text =
-                if (activeNetwork == Network.MAINNET) stringResource(R.string.network_mainnet)
-                else stringResource(R.string.network_testnet),
+              text = stringResource(R.string.network_mainnet),
               style = MaterialTheme.typography.labelMedium,
-              color = if (activeNetwork == Network.MAINNET) VaultBlue else Color(0xFFFF8A80),
+              color = VaultBlue,
               fontWeight = FontWeight.SemiBold,
             )
             if (isBackedUp) {
@@ -1072,6 +984,7 @@ private fun RecentTransfersCard(
               TxStatus.CONFIRMED -> UsdtGreen
               TxStatus.BROADCASTED -> VaultBlue
               TxStatus.SIGNED,
+              TxStatus.UNCERTAIN,
               TxStatus.EXPIRED,
               TxStatus.DRAFT -> Color(0xFFFFCA28)
               TxStatus.FAILED -> MaterialTheme.colorScheme.error
@@ -1147,7 +1060,6 @@ private fun RecentTransfersCard(
 @Composable
 private fun ChainMonitorCard(
   monitorState: ChainMonitorState,
-  activeNetwork: Network,
   onToggleMonitor: () -> Unit,
   onSyncNow: () -> Unit,
 ) {
@@ -1217,7 +1129,7 @@ private fun ChainMonitorCard(
                 .background(indicatorColor)
           )
           Text(
-            text = "$titleText • ${activeNetwork.name}",
+            text = "$titleText • ${stringResource(R.string.network_mainnet)}",
             style = MaterialTheme.typography.labelLarge,
             color = indicatorColor,
             fontWeight = FontWeight.SemiBold,

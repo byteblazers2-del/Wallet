@@ -126,7 +126,6 @@ dependencies {
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)
   implementation(libs.retrofit)
-  implementation(libs.ton.walletkit)
   implementation(libs.ton.kotlin.block.tlb)
   implementation(libs.ton.kotlin.crypto)
   implementation(libs.ton.kotlin.tvm)

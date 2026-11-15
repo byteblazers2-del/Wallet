@@ -48,9 +48,10 @@ class Phase7And8UnitTest {
 
   @Test
   fun jetton_allowlist_validates_master_address_network_and_decimals() {
-    val mainnetSpec = JettonAllowList.usdtFor(Network.MAINNET)
-    val testnetSpec = JettonAllowList.usdtFor(Network.TESTNET)
+    val mainnetSpec = JettonAllowList.usdtFor(Network.MAINNET)!!
 
+    assertEquals(null, JettonAllowList.usdtFor(Network.TESTNET))
+    assertTrue(JettonAllowList.allFor(Network.TESTNET).isEmpty())
     assertNotNull(JettonAllowList.findVerified(mainnetSpec.masterAddress, reportedDecimals = 6))
     assertNull(JettonAllowList.findVerified(mainnetSpec.masterAddress, reportedDecimals = 9))
     assertNull(
@@ -65,7 +66,12 @@ class Phase7And8UnitTest {
         reportedDecimals = 6,
       )
     )
-    assertNotNull(JettonAllowList.findVerified(testnetSpec.masterAddress, reportedDecimals = 6))
+    assertNull(
+      JettonAllowList.findVerified(
+        TonAddress.parse("kQD0GKBM8ZbryVk2aESmzfU6b9b_8era_IkvBSELujFZPsyy", Network.TESTNET).getOrThrow(),
+        reportedDecimals = 6,
+      )
+    )
   }
 
   @Test

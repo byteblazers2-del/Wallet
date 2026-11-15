@@ -26,8 +26,32 @@ class VaultKeyInvalidatedException(cause: Throwable? = null) :
 class VaultAuthRequiredException(cause: Throwable? = null) :
   Exception("Recent biometric or device credential authentication is required", cause)
 
-class VaultWrongPinException(cause: Throwable? = null) :
-  Exception("Incorrect wallet PIN", cause)
+class VaultWrongPinException(
+  cause: Throwable? = null,
+  val attemptsRemaining: Int? = null,
+) : Exception(
+  if (attemptsRemaining != null) {
+    "Incorrect wallet PIN ($attemptsRemaining attempts before lockout)"
+  } else {
+    "Incorrect wallet PIN"
+  },
+  cause,
+)
+
+class VaultPinLockedOutException(
+  val remainingSeconds: Long,
+  cause: Throwable? = null,
+) : Exception("Too many wrong PIN attempts. Try again in ${formatLockoutSeconds(remainingSeconds)}.", cause)
+
+private fun formatLockoutSeconds(seconds: Long): String {
+  val safe = seconds.coerceAtLeast(1L)
+  return if (safe >= 60L) {
+    val mins = (safe + 59L) / 60L
+    "${mins}m"
+  } else {
+    "${safe}s"
+  }
+}
 
 class VaultNotFoundException : Exception("No encrypted vault stored on device")
 
@@ -159,10 +183,13 @@ class AndroidKeyStoreCipherProvider(
 class SecureKeyStore(
   context: Context,
   private val cipherProvider: KeystoreCipherProvider = AndroidKeyStoreCipherProvider(),
+  private val clockMs: () -> Long = { System.currentTimeMillis() },
 ) {
   private val vaultDir = File(context.filesDir, "vault")
   private val seedFile = File(vaultDir, "vault_seed.bin")
+  private val pinLockFile = File(vaultDir, "vault_pin_lock.bin")
   private val random = SecureRandom()
+  private val pinAttemptLock = Any()
 
   // Short-lived in-memory wrapping key for active PIN session (zeroed on lock or expiry)
   private var activePinSessionKey: ByteArray? = null
@@ -191,7 +218,7 @@ class SecureKeyStore(
   }
 
   fun saveWithAppPin(seed32: ByteArray, mnemonicUtf8: ByteArray, pin: CharArray) {
-    require(pin.size >= 4) { "App PIN must be at least 4 digits" }
+    require(isValidPinFormat(pin)) { "App PIN must be 6 to 8 digits" }
     val plaintext = encodePlaintext(seed32, mnemonicUtf8)
     val salt = ByteArray(PIN_SALT_BYTES).also { random.nextBytes(it) }
     val pinKey = derivePinAesKey(pin, salt)
@@ -204,6 +231,7 @@ class SecureKeyStore(
       innerLayer = encodePinEnvelope(salt, innerIv, innerCiphertext)
       val outerEnvelope = cipherProvider.encrypt(innerLayer, requireUserAuth = false)
       writeAtomic(outerEnvelope)
+      synchronized(pinAttemptLock) { clearPinLockoutState() }
       cachePinSessionKey(pinKey)
     } finally {
       Arrays.fill(plaintext, 0.toByte())
@@ -253,6 +281,7 @@ class SecureKeyStore(
 
   fun clearVault() {
     clearPinSession()
+    synchronized(pinAttemptLock) { clearPinLockoutState() }
     if (seedFile.exists()) {
       runCatching {
         val len = seedFile.length().toInt().coerceAtLeast(64)
@@ -275,6 +304,29 @@ class SecureKeyStore(
       return cipherProvider.decrypt(envelope, requireUserAuth = requireUserAuth)
     }
 
+    if (pin != null) {
+      synchronized(pinAttemptLock) {
+        val lockState = loadPinLockoutState()
+        val nowMs = clockMs()
+        if (lockState.lockoutDurationMs > 0L) {
+          val effectiveUntil =
+            if (nowMs + CLOCK_ROLLBACK_TOLERANCE_MS < lockState.lastAttemptEpochMs) {
+              val reanchored = nowMs + lockState.lockoutDurationMs
+              savePinLockoutState(
+                lockState.copy(lockoutUntilEpochMs = reanchored, lastAttemptEpochMs = nowMs)
+              )
+              reanchored
+            } else {
+              lockState.lockoutUntilEpochMs
+            }
+          if (nowMs < effectiveUntil) {
+            val remainingSec = ((effectiveUntil - nowMs + 999L) / 1000L).coerceAtLeast(1L)
+            throw VaultPinLockedOutException(remainingSec)
+          }
+        }
+      }
+    }
+
     val outerPlain = cipherProvider.decrypt(envelope, requireUserAuth = false)
     return try {
       val (salt, innerIv, innerCiphertext) = decodePinEnvelope(outerPlain)
@@ -289,10 +341,17 @@ class SecureKeyStore(
         val cipher = Cipher.getInstance(AES_GCM)
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(derivedKey, "AES"), GCMParameterSpec(128, innerIv))
         val result = cipher.doFinal(innerCiphertext)
+        if (pin != null) {
+          synchronized(pinAttemptLock) { clearPinLockoutState() }
+        }
         cachePinSessionKey(derivedKey)
         result
       } catch (e: GeneralSecurityException) {
-        if (pin != null) throw VaultWrongPinException(e) else throw VaultAuthRequiredException(e)
+        if (pin != null) {
+          throw recordFailedPinAttempt(e)
+        } else {
+          throw VaultAuthRequiredException(e)
+        }
       } finally {
         Arrays.fill(derivedKey, 0.toByte())
       }
@@ -301,15 +360,111 @@ class SecureKeyStore(
     }
   }
 
+  private data class PinLockoutState(
+    val failedAttempts: Int = 0,
+    val lockoutUntilEpochMs: Long = 0L,
+    val lockoutDurationMs: Long = 0L,
+    val lastAttemptEpochMs: Long = 0L,
+  )
+
+  private fun recordFailedPinAttempt(cause: Throwable): Exception =
+    synchronized(pinAttemptLock) {
+      val nowMs = clockMs()
+      val prev = loadPinLockoutState()
+      val nextAttempts = prev.failedAttempts + 1
+      val penaltyMs = lockoutDurationForAttempt(nextAttempts)
+      val untilMs = if (penaltyMs > 0L) nowMs + penaltyMs else 0L
+      savePinLockoutState(
+        PinLockoutState(
+          failedAttempts = nextAttempts,
+          lockoutUntilEpochMs = untilMs,
+          lockoutDurationMs = penaltyMs,
+          lastAttemptEpochMs = nowMs,
+        )
+      )
+      if (penaltyMs > 0L) {
+        VaultPinLockedOutException(((penaltyMs + 999L) / 1000L).coerceAtLeast(1L), cause)
+      } else {
+        val remaining = (FREE_ATTEMPTS_BEFORE_LOCKOUT - nextAttempts).coerceAtLeast(1)
+        VaultWrongPinException(cause = cause, attemptsRemaining = remaining)
+      }
+    }
+
+  private fun lockoutDurationForAttempt(failedAttempts: Int): Long =
+    when {
+      failedAttempts < FREE_ATTEMPTS_BEFORE_LOCKOUT -> 0L
+      failedAttempts == FREE_ATTEMPTS_BEFORE_LOCKOUT -> 30_000L
+      failedAttempts == FREE_ATTEMPTS_BEFORE_LOCKOUT + 1 -> 60_000L
+      failedAttempts == FREE_ATTEMPTS_BEFORE_LOCKOUT + 2 -> 300_000L
+      failedAttempts == FREE_ATTEMPTS_BEFORE_LOCKOUT + 3 -> 900_000L
+      else -> 3_600_000L
+    }
+
+  private fun loadPinLockoutState(): PinLockoutState {
+    if (!pinLockFile.exists()) return PinLockoutState()
+    return runCatching {
+      val encrypted = pinLockFile.readBytes()
+      val plain = cipherProvider.decrypt(encrypted, requireUserAuth = false)
+      try {
+        val json = org.json.JSONObject(plain.decodeToString())
+        PinLockoutState(
+          failedAttempts = json.optInt("failedAttempts", 0).coerceAtLeast(0),
+          lockoutUntilEpochMs = json.optLong("lockoutUntilEpochMs", 0L),
+          lockoutDurationMs = json.optLong("lockoutDurationMs", 0L).coerceAtLeast(0L),
+          lastAttemptEpochMs = json.optLong("lastAttemptEpochMs", 0L),
+        )
+      } finally {
+        Arrays.fill(plain, 0.toByte())
+      }
+    }.getOrElse {
+      // Fail closed against tampered lockout state file if vault exists
+      PinLockoutState(
+        failedAttempts = FREE_ATTEMPTS_BEFORE_LOCKOUT,
+        lockoutUntilEpochMs = clockMs() + 30_000L,
+        lockoutDurationMs = 30_000L,
+        lastAttemptEpochMs = clockMs(),
+      )
+    }
+  }
+
+  private fun savePinLockoutState(state: PinLockoutState) {
+    val json =
+      org.json.JSONObject()
+        .put("failedAttempts", state.failedAttempts)
+        .put("lockoutUntilEpochMs", state.lockoutUntilEpochMs)
+        .put("lockoutDurationMs", state.lockoutDurationMs)
+        .put("lastAttemptEpochMs", state.lastAttemptEpochMs)
+        .toString()
+        .toByteArray(Charsets.UTF_8)
+    try {
+      val encrypted = cipherProvider.encrypt(json, requireUserAuth = false)
+      if (!vaultDir.exists()) vaultDir.mkdirs()
+      val tmp = File(vaultDir, "vault_pin_lock.bin.tmp")
+      tmp.writeBytes(encrypted)
+      if (!tmp.renameTo(pinLockFile)) {
+        pinLockFile.writeBytes(encrypted)
+        tmp.delete()
+      }
+    } finally {
+      Arrays.fill(json, 0.toByte())
+    }
+  }
+
+  private fun clearPinLockoutState() {
+    if (pinLockFile.exists()) {
+      pinLockFile.delete()
+    }
+  }
+
   private fun cachePinSessionKey(keyBytes: ByteArray) {
     clearPinSession()
     activePinSessionKey = keyBytes.copyOf()
-    activePinSessionExpiresAtMs = System.currentTimeMillis() + PIN_SESSION_WINDOW_MS
+    activePinSessionExpiresAtMs = clockMs() + PIN_SESSION_WINDOW_MS
   }
 
   private fun getCachedPinSessionKey(): ByteArray? {
     val cached = activePinSessionKey ?: return null
-    if (System.currentTimeMillis() > activePinSessionExpiresAtMs) {
+    if (clockMs() > activePinSessionExpiresAtMs) {
       clearPinSession()
       return null
     }
@@ -410,6 +565,16 @@ class SecureKeyStore(
   }
 
   companion object {
+    const val MIN_APP_PIN_LENGTH = 6
+    const val MAX_APP_PIN_LENGTH = 8
+    const val FREE_ATTEMPTS_BEFORE_LOCKOUT = 5
+    private const val CLOCK_ROLLBACK_TOLERANCE_MS = 5_000L
+
+    fun isValidPinFormat(pin: CharArray?): Boolean =
+      pin != null &&
+        pin.size in MIN_APP_PIN_LENGTH..MAX_APP_PIN_LENGTH &&
+        pin.all { it in '0'..'9' }
+
     private val MAGIC = byteArrayOf('G'.code.toByte(), 'V'.code.toByte(), '1'.code.toByte())
     private const val AES_GCM = "AES/GCM/NoPadding"
     private const val PIN_ENVELOPE_VERSION: Byte = 2

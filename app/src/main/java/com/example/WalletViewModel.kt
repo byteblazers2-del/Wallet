@@ -1040,10 +1040,6 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     _uiState.update { it.copy(pinPromptMode = null, pinPromptError = null) }
   }
 
-  fun selectNetwork(network: Network) {
-    viewModelScope.launch { walletCore.switchNetwork(network) }
-  }
-
   fun buildReceiveTransferUri(
     network: Network? = null,
     amount: com.example.core.model.Money? = null,

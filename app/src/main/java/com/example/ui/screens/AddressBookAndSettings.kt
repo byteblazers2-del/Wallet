@@ -78,8 +78,6 @@ import com.example.core.wallet.AppSettings
 import com.example.ui.components.VaultGlassCard
 import com.example.ui.components.tactileClickable
 import com.example.ui.theme.JetBrainsMonoFontFamily
-import com.example.ui.theme.TestnetBannerOnRed
-import com.example.ui.theme.TestnetBannerRed
 import com.example.ui.theme.UsdtGreen
 import com.example.ui.theme.VaultBlue
 import com.example.ui.theme.VaultDarkCard
@@ -119,19 +117,6 @@ fun AddressBookScreen(
     snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
     topBar = {
       Column(modifier = Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars)) {
-        if (activeNetwork == Network.TESTNET) {
-          Box(
-            modifier = Modifier.fillMaxWidth().background(TestnetBannerRed).padding(vertical = 6.dp),
-            contentAlignment = Alignment.Center,
-          ) {
-            Text(
-              text = stringResource(R.string.testnet_active_warning),
-              color = TestnetBannerOnRed,
-              style = MaterialTheme.typography.labelMedium,
-              fontWeight = FontWeight.Bold,
-            )
-          }
-        }
         Row(
           modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
           verticalAlignment = Alignment.CenterVertically,
@@ -150,18 +135,14 @@ fun AddressBookScreen(
           )
           Surface(
             shape = RoundedCornerShape(999.dp),
-            color =
-              if (activeNetwork == Network.MAINNET) VaultBlue.copy(alpha = 0.16f)
-              else TestnetBannerRed.copy(alpha = 0.25f),
+            color = VaultBlue.copy(alpha = 0.16f),
             modifier = Modifier.padding(end = 8.dp),
           ) {
             Text(
-              text =
-                if (activeNetwork == Network.MAINNET) stringResource(R.string.network_mainnet)
-                else stringResource(R.string.network_testnet),
+              text = stringResource(R.string.network_mainnet),
               style = MaterialTheme.typography.labelSmall,
               fontWeight = FontWeight.Bold,
-              color = if (activeNetwork == Network.MAINNET) VaultBlue else Color(0xFFFF8A80),
+              color = VaultBlue,
               modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
             )
           }
@@ -213,8 +194,7 @@ fun AddressBookScreen(
                 Text(
                   stringResource(
                     R.string.address_book_address_label,
-                    if (activeNetwork == Network.MAINNET) stringResource(R.string.network_mainnet)
-                    else stringResource(R.string.network_testnet),
+                    stringResource(R.string.network_mainnet),
                   )
                 )
               },
@@ -302,8 +282,7 @@ fun AddressBookScreen(
                 text =
                   stringResource(
                     R.string.address_book_empty,
-                    if (activeNetwork == Network.MAINNET) stringResource(R.string.network_mainnet)
-                    else stringResource(R.string.network_testnet),
+                    stringResource(R.string.network_mainnet),
                   ),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -413,7 +392,7 @@ fun SettingsSheetContent(
   onOpenAddressBook: () -> Unit,
   onCopyUsdtMaster: (String) -> Unit,
 ) {
-  val usdtSpec = remember(activeNetwork) { JettonAllowList.usdtFor(activeNetwork) }
+  val usdtSpec = JettonAllowList.MAINNET_USDT
   Column(
     modifier =
       Modifier.fillMaxWidth()
@@ -559,8 +538,7 @@ fun SettingsSheetContent(
             text =
               stringResource(
                 R.string.settings_usdt_master_label,
-                if (activeNetwork == Network.MAINNET) stringResource(R.string.network_mainnet)
-                else stringResource(R.string.network_testnet),
+                stringResource(R.string.network_mainnet),
               ),
             style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.SemiBold,

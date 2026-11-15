@@ -346,7 +346,6 @@ class MainActivity : FragmentActivity() {
                   activeNetwork = unlocked.activeNetwork,
                   bannerMessage = uiState.bannerMessage,
                   onClearBanner = viewModel::clearBanner,
-                  onSelectNetwork = viewModel::selectNetwork,
                   onOpenBackup = viewModel::openBackupFlow,
                   onLockWallet = viewModel::lockWallet,
                   balanceState = uiState.balanceState,

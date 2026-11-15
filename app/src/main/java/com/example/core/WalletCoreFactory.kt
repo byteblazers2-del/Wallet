@@ -14,7 +14,6 @@ import com.example.core.wallet.AppSettingsStore
 import com.example.core.wallet.VaultMetadataStore
 import com.example.core.wallet.WalletCore
 import com.example.core.wallet.WalletCoreImpl
-import com.example.core.wallet.WalletKitBridge
 
 data class WalletDependencies(
   val walletCore: WalletCore,
@@ -45,14 +44,12 @@ object WalletCoreFactory {
         chainGateway = providerRouter,
         balanceRepository = balanceRepository,
       )
-    val walletKitBridge = WalletKitBridge(context, secureKeyStore)
     val walletCore =
       WalletCoreImpl(
         applicationContext = context,
         authGate = authGate,
         secureKeyStore = secureKeyStore,
         metadataStore = metadataStore,
-        walletKitBridge = walletKitBridge,
         balanceRepository = balanceRepository,
         txManager = txManager,
         devSkipAuth = BuildConfig.DEBUG,

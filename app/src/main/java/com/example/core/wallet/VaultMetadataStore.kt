@@ -29,8 +29,6 @@ class VaultMetadataStore(context: Context) {
       val scheme =
         runCatching { MnemonicScheme.valueOf(schemeName) }
           .getOrDefault(MnemonicScheme.MULTICHAIN)
-      val netName = json.optString("lastActiveNetwork", Network.MAINNET.name)
-      val lastNet = runCatching { Network.valueOf(netName) }.getOrDefault(Network.MAINNET)
       VaultMetadata(
         publicKeyHex = json.getString("publicKeyHex"),
         mainnetRaw = json.getString("mainnetRaw"),
@@ -40,7 +38,7 @@ class VaultMetadataStore(context: Context) {
         securityMode = mode,
         walletVersion = version,
         mnemonicScheme = scheme,
-        lastActiveNetwork = lastNet,
+        lastActiveNetwork = Network.MAINNET,
       )
     }.getOrNull()
   }

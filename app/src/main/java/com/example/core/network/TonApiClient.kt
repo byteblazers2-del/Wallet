@@ -158,6 +158,91 @@ class TonApiClient(
       parseTransactionLookupJson(txBytes)
     }
 
+  override suspend fun lookupJettonTraceStatus(
+    network: Network,
+    messageHashHex: String,
+    normalizedHashHex: String,
+  ): RemoteTxLookup =
+    withContext(Dispatchers.IO) {
+      val rootLookup = lookupMessageStatus(network, messageHashHex, normalizedHashHex)
+      val rootHash = rootLookup.txHash
+      if (rootLookup.status == OnChainMessageStatus.FAILED) {
+        return@withContext rootLookup
+      }
+      if (rootHash.isNullOrBlank()) {
+        return@withContext RemoteTxLookup(
+          status = OnChainMessageStatus.PENDING,
+          txHash = null,
+          lt = null,
+          fee = null,
+          providerName = name,
+        )
+      }
+
+      val baseUrl = endpoints.baseUrlFor(network).trimEnd('/')
+      requestPacer(name)
+      val traceBytes =
+        executeGetAllow404("$baseUrl/v2/traces/$rootHash")
+          ?: return@withContext RemoteTxLookup(
+            status = OnChainMessageStatus.PENDING,
+            txHash = rootHash,
+            lt = rootLookup.lt,
+            fee = null,
+            providerName = name,
+          )
+      val parsedTrace = parseTonApiTraceJson(traceBytes, rootLookup)
+      if (parsedTrace.hasFailureOrBounce) {
+        return@withContext RemoteTxLookup(
+          status = OnChainMessageStatus.FAILED,
+          txHash = parsedTrace.rootTxHash ?: rootHash,
+          lt = parsedTrace.rootLt ?: rootLookup.lt,
+          fee = parsedTrace.totalFees ?: rootLookup.fee,
+          providerName = name,
+          failureReason = "Jetton transfer failed or bounced back",
+        )
+      }
+      if (parsedTrace.inProgress || parsedTrace.nodeCount < 2) {
+        return@withContext RemoteTxLookup(
+          status = OnChainMessageStatus.PENDING,
+          txHash = parsedTrace.rootTxHash ?: rootHash,
+          lt = parsedTrace.rootLt ?: rootLookup.lt,
+          fee = null,
+          providerName = name,
+        )
+      }
+
+      requestPacer(name)
+      val eventBytes = executeGetAllow404("$baseUrl/v2/events/$rootHash")
+      val eventCheck = eventBytes?.let { parseTonApiEventStatusJson(it) }
+      if (eventCheck?.hasFailedAction == true) {
+        return@withContext RemoteTxLookup(
+          status = OnChainMessageStatus.FAILED,
+          txHash = parsedTrace.rootTxHash ?: rootHash,
+          lt = parsedTrace.rootLt ?: rootLookup.lt,
+          fee = parsedTrace.totalFees ?: rootLookup.fee,
+          providerName = name,
+          failureReason = "Jetton transfer action failed",
+        )
+      }
+      if (eventCheck?.inProgress == true) {
+        return@withContext RemoteTxLookup(
+          status = OnChainMessageStatus.PENDING,
+          txHash = parsedTrace.rootTxHash ?: rootHash,
+          lt = parsedTrace.rootLt ?: rootLookup.lt,
+          fee = null,
+          providerName = name,
+        )
+      }
+
+      RemoteTxLookup(
+        status = OnChainMessageStatus.CONFIRMED,
+        txHash = parsedTrace.rootTxHash ?: rootHash,
+        lt = parsedTrace.rootLt ?: rootLookup.lt,
+        fee = parsedTrace.totalFees ?: rootLookup.fee,
+        providerName = name,
+      )
+    }
+
   override suspend fun fetchAccountHistory(
     address: TonAddress,
     afterLt: String?,
@@ -874,6 +959,266 @@ class TonApiClient(
     } catch (e: Exception) {
       throw InvalidPayloadException(name, "Malformed transaction JSON", e)
     }
+  }
+
+  private class TonApiTraceEval(
+    var rootTxHash: String? = null,
+    var rootLt: String? = null,
+  ) {
+    var nodeCount: Int = 0
+    var inProgress: Boolean = false
+    var hasFailureOrBounce: Boolean = false
+    var totalFeesNano: BigInteger = BigInteger.ZERO
+    var hasFee: Boolean = false
+
+    val totalFees: Money?
+      get() = if (hasFee) Money(totalFeesNano, GRAM_DECIMALS) else null
+  }
+
+  private data class TonApiEventStatus(
+    val inProgress: Boolean,
+    val hasFailedAction: Boolean,
+  )
+
+  private fun parseTonApiTraceJson(
+    bodyBytes: ByteArray,
+    fallbackRoot: RemoteTxLookup,
+  ): TonApiTraceEval {
+    if (bodyBytes.isEmpty()) {
+      throw InvalidPayloadException(name, "Empty trace response")
+    }
+    return try {
+      val eval =
+        TonApiTraceEval(
+          rootTxHash = fallbackRoot.txHash,
+          rootLt = fallbackRoot.lt,
+        )
+      val reader = JsonReader.of(Buffer().write(bodyBytes))
+      walkTonApiTraceRootOrNode(reader, eval)
+      eval
+    } catch (e: ProviderException) {
+      throw e
+    } catch (e: Exception) {
+      throw InvalidPayloadException(name, "Malformed trace JSON", e)
+    }
+  }
+
+  private fun walkTonApiTraceRootOrNode(reader: JsonReader, eval: TonApiTraceEval) {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return
+    }
+    var delegatedToTrace = false
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "trace" -> {
+          delegatedToTrace = true
+          walkTonApiTraceRootOrNode(reader, eval)
+        }
+        "in_progress" -> if (readBooleanOrNull(reader) == true) eval.inProgress = true
+        "transaction" -> parseTonApiTraceTransaction(reader, eval)
+        "children" -> {
+          if (reader.peek() == JsonReader.Token.BEGIN_ARRAY) {
+            reader.beginArray()
+            while (reader.hasNext()) {
+              walkTonApiTraceRootOrNode(reader, eval)
+            }
+            reader.endArray()
+          } else {
+            reader.skipValue()
+          }
+        }
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+    if (!delegatedToTrace) {
+      // Accounted for by transaction object inside parseTonApiTraceTransaction
+    }
+  }
+
+  private fun parseTonApiTraceTransaction(reader: JsonReader, eval: TonApiTraceEval) {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return
+    }
+    eval.nodeCount++
+    var txHash: String? = null
+    var lt: String? = null
+    var aborted = false
+    var successField: Boolean? = null
+    var phaseFailed = false
+    var bounceExecuted = false
+    var msgBounced = false
+
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "hash" -> txHash = readScalarAsStringOrSkip(reader)?.takeIf { it.isNotBlank() }
+        "lt" -> lt = readScalarAsStringOrSkip(reader)?.takeIf { it.isNotBlank() }
+        "total_fees" -> {
+          val feeVal = readScalarAsStringOrSkip(reader)?.trim()?.toBigIntegerOrNull()
+          if (feeVal != null) {
+            eval.totalFeesNano = eval.totalFeesNano.add(feeVal)
+            eval.hasFee = true
+          }
+        }
+        "aborted" -> if (readBooleanOrNull(reader) == true) aborted = true
+        "success" -> successField = readBooleanOrNull(reader)
+        "compute_phase" -> if (readTonApiComputePhaseFailed(reader)) phaseFailed = true
+        "action_phase" -> if (readTonApiActionPhaseFailed(reader)) phaseFailed = true
+        "bounce_phase" -> {
+          val bp =
+            when (reader.peek()) {
+              JsonReader.Token.STRING -> reader.nextString().lowercase()
+              JsonReader.Token.BEGIN_OBJECT -> {
+                var t: String? = null
+                reader.beginObject()
+                while (reader.hasNext()) {
+                  when (reader.nextName()) {
+                    "type" -> t = readScalarAsStringOrSkip(reader)?.lowercase()
+                    else -> reader.skipValue()
+                  }
+                }
+                reader.endObject()
+                t
+              }
+              else -> {
+                reader.skipValue()
+                null
+              }
+            }
+          if (bp == "ok") bounceExecuted = true
+        }
+        "in_msg" -> if (readTonApiMsgBounced(reader)) msgBounced = true
+        "out_msgs" -> {
+          if (reader.peek() == JsonReader.Token.BEGIN_ARRAY) {
+            reader.beginArray()
+            while (reader.hasNext()) {
+              if (readTonApiMsgBounced(reader)) msgBounced = true
+            }
+            reader.endArray()
+          } else {
+            reader.skipValue()
+          }
+        }
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+
+    if (eval.nodeCount == 1) {
+      if (txHash != null) eval.rootTxHash = txHash
+      if (lt != null) eval.rootLt = lt
+    }
+    if (aborted || successField == false || phaseFailed || bounceExecuted || msgBounced) {
+      eval.hasFailureOrBounce = true
+    }
+  }
+
+  private fun readTonApiComputePhaseFailed(reader: JsonReader): Boolean {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return false
+    }
+    var skipped = false
+    var success: Boolean? = null
+    var exitCode: Int? = null
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "skipped" -> skipped = readBooleanOrNull(reader) ?: false
+        "success" -> success = readBooleanOrNull(reader)
+        "exit_code" -> exitCode = readScalarAsStringOrSkip(reader)?.trim()?.toIntOrNull()
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+    if (skipped) return false
+    return success == false || (exitCode != null && exitCode != 0)
+  }
+
+  private fun readTonApiActionPhaseFailed(reader: JsonReader): Boolean {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return false
+    }
+    var success: Boolean? = null
+    var resultCode: Int? = null
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "success" -> success = readBooleanOrNull(reader)
+        "result_code" -> resultCode = readScalarAsStringOrSkip(reader)?.trim()?.toIntOrNull()
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+    return success == false || (resultCode != null && resultCode != 0)
+  }
+
+  private fun readTonApiMsgBounced(reader: JsonReader): Boolean {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return false
+    }
+    var bounced = false
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "bounced" -> if (readBooleanOrNull(reader) == true) bounced = true
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+    return bounced
+  }
+
+  private fun parseTonApiEventStatusJson(bodyBytes: ByteArray): TonApiEventStatus? {
+    if (bodyBytes.isEmpty()) return null
+    return runCatching {
+      val reader = JsonReader.of(Buffer().write(bodyBytes))
+      if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) return@runCatching null
+      var inProgress = false
+      var hasFailedAction = false
+      reader.beginObject()
+      while (reader.hasNext()) {
+        when (reader.nextName()) {
+          "in_progress" -> inProgress = readBooleanOrNull(reader) ?: false
+          "actions" -> {
+            if (reader.peek() == JsonReader.Token.BEGIN_ARRAY) {
+              reader.beginArray()
+              while (reader.hasNext()) {
+                if (reader.peek() == JsonReader.Token.BEGIN_OBJECT) {
+                  reader.beginObject()
+                  while (reader.hasNext()) {
+                    when (reader.nextName()) {
+                      "status" -> {
+                        val st = readScalarAsStringOrSkip(reader)
+                        if (st.equals("failed", ignoreCase = true)) {
+                          hasFailedAction = true
+                        }
+                      }
+                      else -> reader.skipValue()
+                    }
+                  }
+                  reader.endObject()
+                } else {
+                  reader.skipValue()
+                }
+              }
+              reader.endArray()
+            } else {
+              reader.skipValue()
+            }
+          }
+          else -> reader.skipValue()
+        }
+      }
+      reader.endObject()
+      TonApiEventStatus(inProgress = inProgress, hasFailedAction = hasFailedAction)
+    }.getOrNull()
   }
 
   private fun parseAccountHistoryJson(

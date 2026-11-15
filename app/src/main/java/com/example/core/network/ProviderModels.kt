@@ -88,6 +88,12 @@ interface ChainGateway : BalanceFetcher {
     normalizedHashHex: String,
   ): Result<RemoteTxLookup>
 
+  suspend fun lookupJettonTraceStatus(
+    network: Network,
+    messageHashHex: String,
+    normalizedHashHex: String,
+  ): Result<RemoteTxLookup>
+
   suspend fun fetchAccountHistory(
     address: TonAddress,
     afterLt: String? = null,
@@ -118,6 +124,12 @@ interface TonNetworkProvider {
   suspend fun sendBoc(network: Network, bocBase64: String): BroadcastResult
 
   suspend fun lookupMessageStatus(
+    network: Network,
+    messageHashHex: String,
+    normalizedHashHex: String,
+  ): RemoteTxLookup
+
+  suspend fun lookupJettonTraceStatus(
     network: Network,
     messageHashHex: String,
     normalizedHashHex: String,

@@ -22,9 +22,6 @@ object JettonAllowList {
   // Official Tether USD (USDt) TON Mainnet Jetton Master contract
   const val MAINNET_USDT_MASTER = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
 
-  // Standard TON Testnet USDt Jetton Master contract for development testing
-  const val TESTNET_USDT_MASTER = "kQD0GKBM8ZbryVk2aESmzfU6b9b_8era_IkvBSELujFZPsyy"
-
   val MAINNET_USDT =
     AllowedJettonSpec(
       assetId = ASSET_ID_USDT,
@@ -35,23 +32,17 @@ object JettonAllowList {
       decimals = USDT_DECIMALS,
     )
 
-  val TESTNET_USDT =
-    AllowedJettonSpec(
-      assetId = ASSET_ID_USDT,
-      symbol = "USDT",
-      name = "Tether USD",
-      network = Network.TESTNET,
-      masterFriendly = TESTNET_USDT_MASTER,
-      decimals = USDT_DECIMALS,
-    )
-
-  fun usdtFor(network: Network): AllowedJettonSpec =
+  fun usdtFor(network: Network): AllowedJettonSpec? =
     when (network) {
       Network.MAINNET -> MAINNET_USDT
-      Network.TESTNET -> TESTNET_USDT
+      Network.TESTNET -> null
     }
 
-  fun allFor(network: Network): List<AllowedJettonSpec> = listOf(usdtFor(network))
+  fun allFor(network: Network): List<AllowedJettonSpec> =
+    when (network) {
+      Network.MAINNET -> listOf(MAINNET_USDT)
+      Network.TESTNET -> emptyList()
+    }
 
   fun findVerified(
     masterAddress: TonAddress,

@@ -4,6 +4,7 @@ enum class TxStatus {
   DRAFT,
   SIGNED,
   BROADCASTED,
+  UNCERTAIN,
   CONFIRMED,
   FAILED,
   EXPIRED;

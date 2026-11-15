@@ -143,7 +143,9 @@ class BalanceRepository(
   }
 
   suspend fun refreshUsdtBalance(address: TonAddress): Result<RemoteJettonBalance> {
-    val spec = JettonAllowList.usdtFor(address.network)
+    val spec =
+      JettonAllowList.usdtFor(address.network)
+        ?: return Result.failure(IllegalArgumentException("USDT is only supported on Mainnet"))
     val result = balanceFetcher.fetchJettonBalance(address, spec)
     result.onSuccess { jettonBal ->
       balanceDao.upsert(
@@ -167,7 +169,7 @@ class BalanceRepository(
     address: TonAddress,
     accountStatus: AccountOnChainStatus,
   ) {
-    val spec = JettonAllowList.usdtFor(address.network)
+    val spec = JettonAllowList.usdtFor(address.network) ?: return
     if (accountStatus == AccountOnChainStatus.NONEXIST) {
       balanceDao.upsert(
         BalanceCacheEntity(

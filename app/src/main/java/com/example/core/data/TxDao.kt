@@ -28,7 +28,7 @@ interface TxDao {
     """
     SELECT * FROM tx
     WHERE accountRaw = :accountRaw AND network = :network
-      AND state IN ('DRAFT', 'SIGNED', 'BROADCASTED')
+      AND state IN ('DRAFT', 'SIGNED', 'BROADCASTED', 'UNCERTAIN')
     ORDER BY createdAtEpochMs ASC
     """
   )

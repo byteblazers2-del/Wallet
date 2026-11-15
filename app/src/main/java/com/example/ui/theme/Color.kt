@@ -18,6 +18,4 @@ val VaultLightBackground = Color(0xFFF3F6FA)
 val VaultLightSurface = Color(0xFFFFFFFF)
 val VaultLightCard = Color(0xFFE9EFF6)
 
-val TestnetBannerRed = Color(0xFFB71C1C)
-val TestnetBannerOnRed = Color(0xFFFFFFFF)
 val UsdtGreen = Color(0xFF26A17B)

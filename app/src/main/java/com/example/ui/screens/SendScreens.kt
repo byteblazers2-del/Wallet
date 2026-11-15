@@ -115,8 +115,6 @@ import com.example.ui.components.SecureScreenEffect
 import com.example.ui.components.VaultGlassCard
 import com.example.ui.components.tactileClickable
 import com.example.ui.theme.JetBrainsMonoFontFamily
-import com.example.ui.theme.TestnetBannerOnRed
-import com.example.ui.theme.TestnetBannerRed
 import com.example.ui.theme.UsdtGreen
 import com.example.ui.theme.VaultBlue
 import com.example.ui.theme.VaultDarkCard
@@ -239,7 +237,6 @@ fun SendFormScreen(
     topBar = {
       SendTopBar(
         title = "Send $activeSymbol",
-        activeNetwork = activeNetwork,
         onBack = onBack,
       )
     },
@@ -313,16 +310,12 @@ fun SendFormScreen(
               }
               Surface(
                 shape = RoundedCornerShape(999.dp),
-                color =
-                  if (activeNetwork == Network.MAINNET) VaultBlue.copy(alpha = 0.16f)
-                  else TestnetBannerRed.copy(alpha = 0.25f),
+                color = VaultBlue.copy(alpha = 0.16f),
               ) {
                 Text(
-                  text =
-                    if (activeNetwork == Network.MAINNET) stringResource(R.string.network_mainnet)
-                    else stringResource(R.string.network_testnet),
+                  text = stringResource(R.string.network_mainnet),
                   style = MaterialTheme.typography.labelSmall,
-                  color = if (activeNetwork == Network.MAINNET) VaultBlue else Color(0xFFFF8A80),
+                  color = VaultBlue,
                   fontWeight = FontWeight.Bold,
                   modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
                 )
@@ -443,8 +436,7 @@ fun SendFormScreen(
                   text =
                     stringResource(
                       R.string.receive_checker_valid_format,
-                      if (activeNetwork == Network.MAINNET) stringResource(R.string.network_mainnet)
-                      else stringResource(R.string.network_testnet),
+                      stringResource(R.string.network_mainnet),
                       typeLabel,
                     ),
                   color = UsdtGreen,
@@ -599,7 +591,6 @@ fun SendConfirmScreen(
     topBar = {
       SendTopBar(
         title = stringResource(R.string.send_confirm_title),
-        activeNetwork = preview.network,
         onBack = { if (!isBusy) onBack() },
       )
     },
@@ -866,6 +857,8 @@ fun SendStatusScreen(
         Triple(Icons.Filled.CheckCircle, UsdtGreen, stringResource(R.string.send_status_confirmed))
       txRecord.state == TxStatus.BROADCASTED ->
         Triple(Icons.Filled.HourglassTop, VaultBlue, stringResource(R.string.send_status_broadcasted))
+      txRecord.state == TxStatus.UNCERTAIN ->
+        Triple(Icons.Filled.HourglassTop, Color(0xFFFFCA28), stringResource(R.string.send_status_uncertain))
       txRecord.state == TxStatus.SIGNED ->
         Triple(Icons.Filled.Schedule, VaultBlue, stringResource(R.string.send_status_signed))
       txRecord.state == TxStatus.EXPIRED ->
@@ -900,7 +893,6 @@ fun SendStatusScreen(
           } else {
             stringResource(R.string.send_status_title)
           },
-        activeNetwork = txRecord.network,
         onBack = onDone,
       )
     },
@@ -1140,7 +1132,6 @@ fun TransactionHistoryScreen(
     topBar = {
       SendTopBar(
         title = stringResource(R.string.history_title),
-        activeNetwork = activeNetwork,
         onBack = onBack,
       )
     },
@@ -1236,6 +1227,7 @@ fun TransactionHistoryScreen(
                     TxStatus.CONFIRMED -> UsdtGreen
                     TxStatus.BROADCASTED -> VaultBlue
                     TxStatus.SIGNED,
+                    TxStatus.UNCERTAIN,
                     TxStatus.EXPIRED,
                     TxStatus.DRAFT -> Color(0xFFFFCA28)
                     TxStatus.FAILED -> MaterialTheme.colorScheme.error
@@ -1317,13 +1309,15 @@ private fun LifecycleStepStrip(state: TxStatus) {
     when (state) {
       TxStatus.FAILED -> "FAILED"
       TxStatus.EXPIRED -> "EXPIRED"
+      TxStatus.UNCERTAIN -> "UNCERTAIN"
       else -> "CONFIRMED"
     }
   val terminalColor =
     when (state) {
       TxStatus.CONFIRMED -> UsdtGreen
       TxStatus.FAILED -> MaterialTheme.colorScheme.error
-      TxStatus.EXPIRED -> Color(0xFFFFCA28)
+      TxStatus.EXPIRED,
+      TxStatus.UNCERTAIN -> Color(0xFFFFCA28)
       else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
 
@@ -1334,7 +1328,12 @@ private fun LifecycleStepStrip(state: TxStatus) {
   ) {
     StepPill("SIGNED", active = signedDone, accent = VaultBlue, modifier = Modifier.weight(1f))
     StepPill("BROADCASTED", active = broadcastDone, accent = VaultBlue, modifier = Modifier.weight(1f))
-    StepPill(terminalLabel, active = state.isTerminal, accent = terminalColor, modifier = Modifier.weight(1f))
+    StepPill(
+      terminalLabel,
+      active = state.isTerminal || state == TxStatus.UNCERTAIN,
+      accent = terminalColor,
+      modifier = Modifier.weight(1f),
+    )
   }
 }
 
@@ -1421,23 +1420,9 @@ private fun HashCopyRow(label: String, hashHex: String, onCopy: () -> Unit) {
 @Composable
 private fun SendTopBar(
   title: String,
-  activeNetwork: Network,
   onBack: () -> Unit,
 ) {
   Column(modifier = Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars)) {
-    if (activeNetwork == Network.TESTNET) {
-      Box(
-        modifier = Modifier.fillMaxWidth().background(TestnetBannerRed).padding(vertical = 6.dp),
-        contentAlignment = Alignment.Center,
-      ) {
-        Text(
-          text = stringResource(R.string.testnet_active_warning),
-          color = TestnetBannerOnRed,
-          style = MaterialTheme.typography.labelMedium,
-          fontWeight = FontWeight.Bold,
-        )
-      }
-    }
     Row(
       modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
       verticalAlignment = Alignment.CenterVertically,
@@ -1456,18 +1441,14 @@ private fun SendTopBar(
       )
       Surface(
         shape = RoundedCornerShape(999.dp),
-        color =
-          if (activeNetwork == Network.MAINNET) VaultBlue.copy(alpha = 0.16f)
-          else TestnetBannerRed.copy(alpha = 0.25f),
+        color = VaultBlue.copy(alpha = 0.16f),
         modifier = Modifier.padding(end = 8.dp),
       ) {
         Text(
-          text =
-            if (activeNetwork == Network.MAINNET) stringResource(R.string.network_mainnet)
-            else stringResource(R.string.network_testnet),
+          text = stringResource(R.string.network_mainnet),
           style = MaterialTheme.typography.labelSmall,
           fontWeight = FontWeight.Bold,
-          color = if (activeNetwork == Network.MAINNET) VaultBlue else Color(0xFFFF8A80),
+          color = VaultBlue,
           modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
         )
       }

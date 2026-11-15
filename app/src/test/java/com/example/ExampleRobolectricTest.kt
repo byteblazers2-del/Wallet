@@ -24,6 +24,7 @@ import com.example.core.keystore.KeystoreCipherProvider
 import com.example.core.keystore.SecureKeyStore
 import com.example.core.keystore.VaultAuthRequiredException
 import com.example.core.keystore.VaultKeyInvalidatedException
+import com.example.core.keystore.VaultPinLockedOutException
 import com.example.core.keystore.VaultWrongPinException
 import com.example.core.model.AccountOnChainStatus
 import com.example.core.model.AllowedJettonSpec
@@ -69,10 +70,10 @@ import com.example.core.wallet.AppSettingsStore
 import com.example.core.wallet.MnemonicService
 import com.example.core.wallet.VaultMetadataStore
 import com.example.core.wallet.WalletCoreImpl
-import com.example.core.wallet.WalletKitBridge
 import com.example.ui.screens.AddressBookScreen
 import com.example.ui.screens.ImportSelectAccountScreen
 import com.example.ui.screens.LockedVaultScreen
+import com.example.ui.screens.PinPromptDialog
 import com.example.ui.screens.ReceiveSheetContent
 import com.example.ui.screens.RecoveryPhraseScreen
 import com.example.ui.screens.SendConfirmScreen
@@ -149,7 +150,6 @@ class ExampleRobolectricTest {
           activeNetwork = Network.MAINNET,
           bannerMessage = null,
           onClearBanner = {},
-          onSelectNetwork = {},
           onOpenBackup = {},
           onLockWallet = {},
         )
@@ -157,6 +157,8 @@ class ExampleRobolectricTest {
     }
 
     composeTestRule.onNodeWithTag("testnet_banner").assertDoesNotExist()
+    composeTestRule.onNodeWithTag("network_toggle_pill").assertDoesNotExist()
+    composeTestRule.onNodeWithTag("network_mainnet_badge").assertIsDisplayed()
     composeTestRule.onNodeWithTag("backup_warning_banner").assertIsDisplayed()
     composeTestRule.onNodeWithTag("wallet_hero_card").assertIsDisplayed()
     composeTestRule.onNodeWithTag("assets_card").performScrollTo().assertIsDisplayed()
@@ -165,32 +167,31 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun testnet_mode_displays_testnet_banner() {
-    val metadata =
-      VaultMetadata(
-        publicKeyHex = "00".repeat(32),
-        mainnetRaw = "0:" + "00".repeat(32),
-        testnetRaw = "0:" + "00".repeat(32),
-        isBackedUp = true,
-        createdAtEpochMs = 1_700_000_000_000L,
-      )
-    composeTestRule.setContent {
-      GramVaultTheme {
-        WalletHomeScreen(
-          metadata = metadata,
-          activeNetwork = Network.TESTNET,
-          bannerMessage = null,
-          onClearBanner = {},
-          onSelectNetwork = {},
-          onOpenBackup = {},
-          onLockWallet = {},
-        )
-      }
-    }
+  fun mainnet_only_enforcement_blocks_testnet_wallet_operations() = runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    File(context.filesDir, "vault").deleteRecursively()
 
-    composeTestRule.onNodeWithTag("testnet_banner").assertIsDisplayed()
-    composeTestRule.onNodeWithTag("backup_warning_banner").assertDoesNotExist()
-    composeTestRule.onNodeWithTag("backed_up_badge").assertIsDisplayed()
+    val fakeAuth = FakeAuthGate(deviceSecure = true, nextResult = AuthResult.Authenticated)
+    val fakeCipher = InMemoryAesCipherProvider().apply { isAuthenticated = true }
+    val core =
+      WalletCoreImpl(
+        applicationContext = context,
+        authGate = fakeAuth,
+        secureKeyStore = SecureKeyStore(context, fakeCipher),
+        metadataStore = VaultMetadataStore(context),
+      )
+
+    fakeCipher.isAuthenticated = true
+    assertTrue(core.createWallet(Network.TESTNET).isFailure)
+    val created = core.createWallet(Network.MAINNET).getOrThrow()
+    created.mnemonic.wipe()
+
+    core.switchNetwork(Network.TESTNET)
+    val unlocked = core.vaultState.value as VaultState.Unlocked
+    assertEquals(Network.MAINNET, unlocked.activeNetwork)
+    assertEquals(Network.MAINNET, core.preferredNetwork())
+    core.lockWallet()
+    assertTrue(core.unlockWallet(Network.TESTNET).isFailure)
   }
 
   @Test
@@ -238,7 +239,7 @@ class ExampleRobolectricTest {
     val keyStore = SecureKeyStore(context, fakeCipher)
     val metaStore = VaultMetadataStore(context)
 
-    val core = WalletCoreImpl(context, fakeAuth, keyStore, metaStore, walletKitBridge = null)
+    val core = WalletCoreImpl(context, fakeAuth, keyStore, metaStore)
     assertEquals(VaultState.Uninitialized, core.vaultState.value)
 
     fakeCipher.isAuthenticated = true
@@ -261,7 +262,7 @@ class ExampleRobolectricTest {
 
     fakeCipher.isAuthenticated = false
     fakeAuth.nextResult = AuthResult.Cancelled
-    val restartedCore = WalletCoreImpl(context, fakeAuth, keyStore, metaStore, walletKitBridge = null)
+    val restartedCore = WalletCoreImpl(context, fakeAuth, keyStore, metaStore)
     assertTrue(restartedCore.vaultState.value is VaultState.Locked)
     assertTrue(restartedCore.unlockWallet(Network.MAINNET).isFailure)
 
@@ -287,25 +288,143 @@ class ExampleRobolectricTest {
     val keyStore = SecureKeyStore(context, fakeCipher)
     val metaStore = VaultMetadataStore(context)
 
-    val core = WalletCoreImpl(context, fakeAuth, keyStore, metaStore, walletKitBridge = null)
+    val core = WalletCoreImpl(context, fakeAuth, keyStore, metaStore)
     assertTrue(core.createWallet(Network.MAINNET, appPin = null).isFailure)
+    assertTrue(core.createWallet(Network.MAINNET, appPin = "2468".toCharArray()).isFailure)
+    assertTrue(core.createWallet(Network.MAINNET, appPin = "12345".toCharArray()).isFailure)
+    assertTrue(core.createWallet(Network.MAINNET, appPin = "123456789".toCharArray()).isFailure)
+    assertTrue(core.createWallet(Network.MAINNET, appPin = "12345a".toCharArray()).isFailure)
 
-    val created = core.createWallet(Network.MAINNET, appPin = "2468".toCharArray()).getOrThrow()
+    val created = core.createWallet(Network.MAINNET, appPin = "246810".toCharArray()).getOrThrow()
     val words = (0 until created.mnemonic.wordCount).map { String(created.mnemonic.wordAt(it)) }
     val rawCipherFile = File(context.filesDir, "vault/vault_seed.bin").readBytes().decodeToString()
     assertFalse(words.any { rawCipherFile.contains(it) })
     created.mnemonic.wipe()
 
-    val restartedCore = WalletCoreImpl(context, fakeAuth, keyStore, metaStore, walletKitBridge = null)
+    val restartedCore = WalletCoreImpl(context, fakeAuth, keyStore, metaStore)
     assertTrue(restartedCore.vaultState.value is VaultState.Locked)
 
-    val wrongPinResult = restartedCore.unlockWallet(Network.MAINNET, appPin = "9999".toCharArray())
-    assertTrue(wrongPinResult.exceptionOrNull() is VaultWrongPinException)
+    val shortPinUnlock = restartedCore.unlockWallet(Network.MAINNET, appPin = "2468".toCharArray())
+    assertTrue(shortPinUnlock.isFailure)
+    assertTrue(shortPinUnlock.exceptionOrNull()?.message?.contains("6 to 8") == true)
+
+    val wrongPinResult = restartedCore.unlockWallet(Network.MAINNET, appPin = "999999".toCharArray())
+    val wrongErr = wrongPinResult.exceptionOrNull() as? VaultWrongPinException
+    assertTrue(wrongErr != null)
+    assertEquals(4, wrongErr?.attemptsRemaining)
     assertTrue(restartedCore.vaultState.value is VaultState.Locked)
 
-    val okMeta = restartedCore.unlockWallet(Network.MAINNET, appPin = "2468".toCharArray()).getOrThrow()
+    val okMeta = restartedCore.unlockWallet(Network.MAINNET, appPin = "246810".toCharArray()).getOrThrow()
     assertEquals(VaultSecurityMode.APP_PIN_WITH_KEYSTORE, okMeta.securityMode)
     assertEquals(created.publicKeyHex, okMeta.publicKeyHex)
+  }
+
+  @Test
+  fun app_pin_enforces_persistent_exponential_lockout_and_rollback_protection() = runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    File(context.filesDir, "vault").deleteRecursively()
+
+    var fakeNowMs = 1_700_000_000_000L
+    val fakeAuth = FakeAuthGate(deviceSecure = false, nextResult = AuthResult.NoDeviceSecurity)
+    val fakeCipher = InMemoryAesCipherProvider()
+    val metaStore = VaultMetadataStore(context)
+
+    val initialKeyStore = SecureKeyStore(context, fakeCipher, clockMs = { fakeNowMs })
+    val initialCore =
+      WalletCoreImpl(context, fakeAuth, initialKeyStore, metaStore)
+    val created = initialCore.createWallet(Network.MAINNET, appPin = "482910".toCharArray()).getOrThrow()
+    created.mnemonic.wipe()
+
+    fun newRestartedCore(): WalletCoreImpl =
+      WalletCoreImpl(
+        context,
+        fakeAuth,
+        SecureKeyStore(context, fakeCipher, clockMs = { fakeNowMs }),
+        metaStore,
+      )
+
+    val restarted = newRestartedCore()
+    for (attempt in 1..4) {
+      val err = restarted.unlockWallet(Network.MAINNET, "00000$attempt".toCharArray()).exceptionOrNull()
+      val wrong = err as? VaultWrongPinException
+      assertTrue("Expected VaultWrongPinException on attempt $attempt", wrong != null)
+      assertEquals(5 - attempt, wrong?.attemptsRemaining)
+    }
+
+    // 5th wrong attempt triggers 30s lockout
+    val fifthErr =
+      restarted.unlockWallet(Network.MAINNET, "000005".toCharArray()).exceptionOrNull()
+        as? VaultPinLockedOutException
+    assertTrue(fifthErr != null)
+    assertEquals(30L, fifthErr?.remainingSeconds)
+
+    // Persists across process restart & blocks even the correct PIN before window expires
+    fakeNowMs += 10_000L
+    val restartedAgain = newRestartedCore()
+    val earlyCorrectErr =
+      restartedAgain.unlockWallet(Network.MAINNET, "482910".toCharArray()).exceptionOrNull()
+        as? VaultPinLockedOutException
+    assertTrue(earlyCorrectErr != null)
+    assertEquals(20L, earlyCorrectErr?.remainingSeconds)
+
+    // Clock rollback must not bypass lockout
+    fakeNowMs -= 20_000L
+    val rollbackErr =
+      restartedAgain.unlockWallet(Network.MAINNET, "482910".toCharArray()).exceptionOrNull()
+        as? VaultPinLockedOutException
+    assertTrue(rollbackErr != null)
+    assertEquals(30L, rollbackErr?.remainingSeconds)
+
+    // After 30s expires, a 6th wrong attempt escalates lockout to 60s
+    fakeNowMs += 30_000L
+    val sixthErr =
+      restartedAgain.unlockWallet(Network.MAINNET, "111111".toCharArray()).exceptionOrNull()
+        as? VaultPinLockedOutException
+    assertTrue(sixthErr != null)
+    assertEquals(60L, sixthErr?.remainingSeconds)
+
+    // After 60s expires, correct PIN unlocks and resets failed attempt counter
+    fakeNowMs += 60_000L
+    val unlocked = restartedAgain.unlockWallet(Network.MAINNET, "482910".toCharArray()).getOrThrow()
+    assertEquals(created.publicKeyHex, unlocked.publicKeyHex)
+
+    restartedAgain.lockWallet()
+    val postResetWrong =
+      restartedAgain.unlockWallet(Network.MAINNET, "999999".toCharArray()).exceptionOrNull()
+        as? VaultWrongPinException
+    assertEquals(4, postResetWrong?.attemptsRemaining)
+  }
+
+  @Test
+  fun pin_prompt_dialog_requires_6_to_8_digits_in_ui() {
+    var submittedPin: String? = null
+    composeTestRule.setContent {
+      GramVaultTheme {
+        PinPromptDialog(
+          isSetupMode = true,
+          errorMessage = null,
+          onDismiss = {},
+          onSubmitPin = { chars -> submittedPin = String(chars) },
+        )
+      }
+    }
+
+    composeTestRule.onNodeWithTag("vault_pin_input").performTextInput("12345")
+    composeTestRule.onNodeWithTag("vault_pin_confirm_input").performTextInput("12345")
+    composeTestRule.onNodeWithTag("vault_pin_submit_button").performClick()
+    composeTestRule.waitForIdle()
+
+    composeTestRule.onNodeWithTag("vault_pin_error").assertIsDisplayed()
+    assertEquals(null, submittedPin)
+
+    composeTestRule.onNodeWithTag("vault_pin_input").performTextClearance()
+    composeTestRule.onNodeWithTag("vault_pin_input").performTextInput("123456")
+    composeTestRule.onNodeWithTag("vault_pin_confirm_input").performTextClearance()
+    composeTestRule.onNodeWithTag("vault_pin_confirm_input").performTextInput("123456")
+    composeTestRule.onNodeWithTag("vault_pin_submit_button").performClick()
+    composeTestRule.waitForIdle()
+
+    assertEquals("123456", submittedPin)
   }
 
   @Test
@@ -317,7 +436,7 @@ class ExampleRobolectricTest {
     val fakeCipher = InMemoryAesCipherProvider()
     val keyStore = SecureKeyStore(context, fakeCipher)
     val metaStore = VaultMetadataStore(context)
-    val core = WalletCoreImpl(context, fakeAuth, keyStore, metaStore, walletKitBridge = null)
+    val core = WalletCoreImpl(context, fakeAuth, keyStore, metaStore)
 
     val chars12 = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".toCharArray()
     val phrase = MnemonicService.parseSpaceSeparatedChars(chars12)
@@ -339,9 +458,9 @@ class ExampleRobolectricTest {
       phrase.wipe()
     }
 
-    val restartedCore = WalletCoreImpl(context, fakeAuth, keyStore, metaStore, walletKitBridge = null)
+    val restartedCore = WalletCoreImpl(context, fakeAuth, keyStore, metaStore)
     assertTrue(restartedCore.vaultState.value is VaultState.Locked)
-    val unlocked = restartedCore.unlockWallet(Network.TESTNET).getOrThrow()
+    val unlocked = restartedCore.unlockWallet(Network.MAINNET).getOrThrow()
     assertEquals(WalletVersion.V4R2, unlocked.walletVersion)
     assertEquals(MnemonicScheme.MULTICHAIN, unlocked.mnemonicScheme)
   }
@@ -407,7 +526,7 @@ class ExampleRobolectricTest {
         var nextFetchResult: Result<RemoteAccountBalance> =
           Result.success(
             RemoteAccountBalance(
-              address = TonAddress("0:" + "33".repeat(32), Network.TESTNET),
+              address = TonAddress("0:" + "33".repeat(32), Network.MAINNET),
               balance = Money.ofNano(12_340_000_000L),
               status = AccountOnChainStatus.ACTIVE,
               providerName = "TonAPI",
@@ -440,11 +559,11 @@ class ExampleRobolectricTest {
             clockMs = { nowMs },
             cacheTtlMs = 25_000L,
           )
-        val address = TonAddress("0:" + "33".repeat(32), Network.TESTNET)
+        val address = TonAddress("0:" + "33".repeat(32), Network.MAINNET)
 
         assertTrue(repo.refreshBalance(address).isSuccess)
         val cachedEntity =
-          db.balanceCacheDao().getBalance(address.raw, Network.TESTNET.name, "GRAM")!!
+          db.balanceCacheDao().getBalance(address.raw, Network.MAINNET.name, "GRAM")!!
         assertEquals("12340000000", cachedEntity.amountUnits)
 
         val freshState = repo.observeBalance(address).first()
@@ -479,7 +598,7 @@ class ExampleRobolectricTest {
         assertEquals("TON Center", recoveredState.providerName)
 
         repo.clearCache()
-        assertEquals(null, db.balanceCacheDao().getBalance(address.raw, Network.TESTNET.name, "GRAM"))
+        assertEquals(null, db.balanceCacheDao().getBalance(address.raw, Network.MAINNET.name, "GRAM"))
       } finally {
         db.close()
       }
@@ -498,8 +617,8 @@ class ExampleRobolectricTest {
     var refreshCount = 0
     val staleBalance =
       BalanceState(
-        network = Network.TESTNET,
-        address = metadata.addressFor(Network.TESTNET),
+        network = Network.MAINNET,
+        address = metadata.addressFor(Network.MAINNET),
         gramBalance = Money.ofNano(12_345_000_000L),
         accountStatus = AccountOnChainStatus.ACTIVE,
         isLoading = false,
@@ -513,10 +632,9 @@ class ExampleRobolectricTest {
       GramVaultTheme {
         WalletHomeScreen(
           metadata = metadata,
-          activeNetwork = Network.TESTNET,
+          activeNetwork = Network.MAINNET,
           bannerMessage = null,
           onClearBanner = {},
-          onSelectNetwork = {},
           onOpenBackup = {},
           onLockWallet = {},
           balanceState = staleBalance,
@@ -535,17 +653,17 @@ class ExampleRobolectricTest {
 
   @Test
   fun receive_sheet_builds_transfer_link_and_validates_addresses() {
-    val testnetAddr = TonAddress("0:" + "55".repeat(32), Network.TESTNET)
-    val friendlyNonBounce = testnetAddr.toFriendly(bounceable = false)
-    val testnetBounce = testnetAddr.toFriendly(bounceable = true)
-    val mainnetNonBounce = TonAddress(testnetAddr.raw, Network.MAINNET).toFriendly(bounceable = false)
+    val mainnetAddr = TonAddress("0:" + "55".repeat(32), Network.MAINNET)
+    val friendlyNonBounce = mainnetAddr.toFriendly(bounceable = false)
+    val mainnetBounce = mainnetAddr.toFriendly(bounceable = true)
+    val testnetNonBounce = TonAddress(mainnetAddr.raw, Network.TESTNET).toFriendly(bounceable = false)
 
     composeTestRule.setContent {
       GramVaultTheme {
         ReceiveSheetContent(
-          network = Network.TESTNET,
+          network = Network.MAINNET,
           friendlyAddress = friendlyNonBounce,
-          rawAddress = testnetAddr.raw,
+          rawAddress = mainnetAddr.raw,
           onCopyAddress = { _, _, _ -> },
           onSharePayload = {},
         )
@@ -553,7 +671,7 @@ class ExampleRobolectricTest {
     }
 
     composeTestRule.onNodeWithTag("receive_full_address_text").assertTextEquals(friendlyNonBounce)
-    composeTestRule.onNodeWithTag("receive_raw_address_text").assertTextEquals(testnetAddr.raw)
+    composeTestRule.onNodeWithTag("receive_raw_address_text").assertTextEquals(mainnetAddr.raw)
 
     // Switch to Transfer Link mode and enter amount + comment
     composeTestRule.onNodeWithTag("qr_mode_link_button").performClick()
@@ -569,20 +687,20 @@ class ExampleRobolectricTest {
     composeTestRule.onNodeWithTag("receive_amount_input").performTextInput("0")
     composeTestRule.onNodeWithTag("receive_amount_error").performScrollTo().assertIsDisplayed()
 
-    // Open Address Validity Checker and verify valid Testnet bounceable vs Mainnet mismatch vs bad checksum
+    // Open Address Validity Checker and verify valid Mainnet bounceable vs Testnet mismatch vs bad checksum
     composeTestRule.onNodeWithTag("address_checker_toggle").performScrollTo().performClick()
-    composeTestRule.onNodeWithTag("address_checker_input").performScrollTo().performTextInput(testnetBounce)
+    composeTestRule.onNodeWithTag("address_checker_input").performScrollTo().performTextInput(mainnetBounce)
     composeTestRule.onNodeWithTag("address_checker_result")
       .performScrollTo()
-      .assertTextContains("Valid Testnet address (Friendly • Bounceable)", substring = true)
+      .assertTextContains("Valid Mainnet address (Friendly • Bounceable)", substring = true)
 
     composeTestRule.onNodeWithTag("address_checker_input").performScrollTo().performTextClearance()
-    composeTestRule.onNodeWithTag("address_checker_input").performTextInput(mainnetNonBounce)
+    composeTestRule.onNodeWithTag("address_checker_input").performTextInput(testnetNonBounce)
     composeTestRule.onNodeWithTag("address_checker_result")
       .performScrollTo()
-      .assertTextContains("Mainnet address is not allowed on Testnet", substring = true)
+      .assertTextContains("Testnet address is not allowed on Mainnet", substring = true)
 
-    val badChecksum = testnetBounce.dropLast(1) + if (testnetBounce.last() == 'A') 'B' else 'A'
+    val badChecksum = mainnetBounce.dropLast(1) + if (mainnetBounce.last() == 'A') 'B' else 'A'
     composeTestRule.onNodeWithTag("address_checker_input").performScrollTo().performTextClearance()
     composeTestRule.onNodeWithTag("address_checker_input").performTextInput(badChecksum)
     composeTestRule.onNodeWithTag("address_checker_result")
@@ -606,7 +724,6 @@ class ExampleRobolectricTest {
         authGate = fakeAuth,
         secureKeyStore = keyStore,
         metadataStore = metaStore,
-        walletKitBridge = null,
         devSkipAuth = true,
       )
     assertEquals(VaultSecurityMode.DEV_UNAUTH_KEYSTORE, core.activeSecurityMode())
@@ -630,7 +747,6 @@ class ExampleRobolectricTest {
         authGate = fakeAuth,
         secureKeyStore = keyStore,
         metadataStore = metaStore,
-        walletKitBridge = null,
         devSkipAuth = true,
       )
     assertTrue(restartedCore.vaultState.value is VaultState.Locked)
@@ -705,8 +821,8 @@ class ExampleRobolectricTest {
         val keyStore = SecureKeyStore(context, fakeCipher)
         val metaStore = VaultMetadataStore(context)
 
-        val uninitDest = TonAddress("0:" + "11".repeat(32), Network.TESTNET)
-        val activeDest = TonAddress("0:" + "22".repeat(32), Network.TESTNET)
+        val uninitDest = TonAddress("0:" + "11".repeat(32), Network.MAINNET)
+        val activeDest = TonAddress("0:" + "22".repeat(32), Network.MAINNET)
         val gateway = FakeChainGateway(db = db, nowProvider = { nowMs })
         gateway.walletStatuses[uninitDest.raw] = AccountOnChainStatus.NONEXIST
         gateway.walletStatuses[activeDest.raw] = AccountOnChainStatus.ACTIVE
@@ -727,14 +843,13 @@ class ExampleRobolectricTest {
             authGate = fakeAuth,
             secureKeyStore = keyStore,
             metadataStore = metaStore,
-            walletKitBridge = null,
             txManager = txManager,
             clockMs = { nowMs },
           )
 
-        val created = core.createWallet(Network.TESTNET).getOrThrow()
+        val created = core.createWallet(Network.MAINNET).getOrThrow()
         created.mnemonic.wipe()
-        val senderRaw = created.testnetAddress.raw
+        val senderRaw = created.mainnetAddress.raw
         gateway.senderAddressRaw = senderRaw
 
         // 1. NONEXIST destination -> effectiveBounce MUST be false
@@ -793,24 +908,191 @@ class ExampleRobolectricTest {
         assertEquals("BROADCASTED", afterRebroadcast.state)
         assertEquals(1, gateway.sendBocCount)
 
-        // 7. After valid_until + grace expires and seqno has NOT advanced -> EXPIRED
+        // 7. After valid_until + grace expires while already BROADCASTED and seqno unchanged -> UNCERTAIN
         nowMs += 200_000L
         core.recoverPendingTransactions()
         val afterExpiry = db.txDao().getById(queuedTx.id)!!
-        assertEquals("EXPIRED", afterExpiry.state)
+        assertEquals("UNCERTAIN", afterExpiry.state)
+
+        // New send remains blocked while UNCERTAIN until chain hash proof arrives
+        val blockedByUncertain = core.prepareTransfer(activeDest.toFriendly(false), "1.0")
+        assertTrue(blockedByUncertain.isFailure)
+        assertTrue(blockedByUncertain.exceptionOrNull() is PendingTransferConflictException)
+
+        // Hash proof resolves UNCERTAIN -> CONFIRMED
+        gateway.nextLookup =
+          RemoteTxLookup(
+            status = OnChainMessageStatus.CONFIRMED,
+            txHash = "late_hash_02",
+            lt = "9002",
+            fee = Money.ofNano(4_000_000L),
+            providerName = "TonAPI",
+          )
+        val resolved = core.refreshTransactionStatus(queuedTx.id)!!
+        assertEquals(TxStatus.CONFIRMED, resolved.state)
       } finally {
         db.close()
       }
     }
 
   @Test
+  fun seqno_advance_moves_broadcasted_and_signed_to_uncertain_without_false_confirm_or_rebroadcast() =
+    runTest {
+      val context = ApplicationProvider.getApplicationContext<Context>()
+      File(context.filesDir, "vault").deleteRecursively()
+      val db =
+        Room.inMemoryDatabaseBuilder(context, GramVaultDatabase::class.java)
+          .allowMainThreadQueries()
+          .build()
+      try {
+        var nowMs = 1_700_000_000_000L
+        val fakeAuth = FakeAuthGate(deviceSecure = true, nextResult = AuthResult.Authenticated)
+        val fakeCipher = InMemoryAesCipherProvider().apply { isAuthenticated = true }
+        val keyStore = SecureKeyStore(context, fakeCipher)
+        val metaStore = VaultMetadataStore(context)
+
+        val dest = TonAddress("0:" + "22".repeat(32), Network.MAINNET)
+        val gateway = FakeChainGateway(db = db, nowProvider = { nowMs })
+        gateway.walletStatuses[dest.raw] = AccountOnChainStatus.ACTIVE
+        gateway.senderBalance = Money.ofNano(50_000_000_000L)
+        gateway.senderStatus = AccountOnChainStatus.ACTIVE
+        gateway.senderSeqno = 10
+
+        val txManager =
+          TxManager(
+            txDao = db.txDao(),
+            chainGateway = gateway,
+            clockMs = { nowMs },
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+          )
+        val core =
+          WalletCoreImpl(
+            applicationContext = context,
+            authGate = fakeAuth,
+            secureKeyStore = keyStore,
+            metadataStore = metaStore,
+            txManager = txManager,
+            clockMs = { nowMs },
+          )
+
+        val created = core.createWallet(Network.MAINNET).getOrThrow()
+        created.mnemonic.wipe()
+        gateway.senderAddressRaw = created.mainnetAddress.raw
+
+        // 1. BROADCASTED tx + external seqno advance + 20s elapsed + PENDING lookup -> UNCERTAIN (not CONFIRMED)
+        val preview1 = core.prepareTransfer(dest.toFriendly(false), "1.0").getOrThrow()
+        val tx1 = core.confirmAndSend(preview1).getOrThrow()
+        assertEquals(TxStatus.BROADCASTED, tx1.state)
+
+        gateway.senderSeqno = 11
+        nowMs += 20_000L
+        core.recoverPendingTransactions()
+        val tx1Entity = db.txDao().getById(tx1.id)!!
+        assertEquals(TxStatus.UNCERTAIN.name, tx1Entity.state)
+        assertEquals(null, tx1Entity.bocBase64)
+
+        val dup1 = core.prepareTransfer(dest.toFriendly(false), "0.5")
+        assertTrue(dup1.exceptionOrNull() is PendingTransferConflictException)
+
+        gateway.nextLookup =
+          RemoteTxLookup(
+            status = OnChainMessageStatus.CONFIRMED,
+            txHash = "proof_hash_1",
+            lt = "10001",
+            fee = Money.ofNano(3_500_000L),
+            providerName = "TonAPI",
+          )
+        assertEquals(TxStatus.CONFIRMED, core.refreshTransactionStatus(tx1.id)?.state)
+
+        // 2. Unbroadcasted SIGNED tx + seqno advance -> UNCERTAIN (not EXPIRED), BOC cleared, never rebroadcasts
+        gateway.nextLookup = RemoteTxLookup(OnChainMessageStatus.PENDING, null, null, null, "TonAPI")
+        gateway.sendBocFailure = TransportException("TonAPI", IOException("timeout"))
+        val preview2 = core.prepareTransfer(dest.toFriendly(false), "1.5").getOrThrow()
+        val tx2 = core.confirmAndSend(preview2).getOrThrow()
+        assertEquals(TxStatus.SIGNED, tx2.state)
+
+        gateway.sendBocFailure = null
+        gateway.sendBocCount = 0
+        gateway.senderSeqno = 12
+        core.recoverPendingTransactions()
+        val tx2Entity = db.txDao().getById(tx2.id)!!
+        assertEquals(TxStatus.UNCERTAIN.name, tx2Entity.state)
+        assertEquals(null, tx2Entity.bocBase64)
+        assertEquals(0, gateway.sendBocCount)
+
+        gateway.nextLookup =
+          RemoteTxLookup(
+            status = OnChainMessageStatus.FAILED,
+            txHash = "proof_hash_2",
+            lt = "10002",
+            fee = Money.ofNano(3_000_000L),
+            providerName = "TonAPI",
+            failureReason = "Aborted on chain",
+          )
+        assertEquals(TxStatus.FAILED, core.refreshTransactionStatus(tx2.id)?.state)
+
+        // 3. Unbroadcasted SIGNED tx + unchanged seqno past valid_until + grace -> EXPIRED
+        gateway.nextLookup = RemoteTxLookup(OnChainMessageStatus.PENDING, null, null, null, "TonAPI")
+        gateway.sendBocFailure = TransportException("TonAPI", IOException("timeout"))
+        val preview3 = core.prepareTransfer(dest.toFriendly(false), "0.75").getOrThrow()
+        val tx3 = core.confirmAndSend(preview3).getOrThrow()
+        assertEquals(TxStatus.SIGNED, tx3.state)
+
+        nowMs += 200_000L
+        gateway.sendBocFailure = null
+        core.recoverPendingTransactions()
+        assertEquals(TxStatus.EXPIRED.name, db.txDao().getById(tx3.id)!!.state)
+      } finally {
+        db.close()
+      }
+    }
+
+  @Test
+  fun send_status_screen_renders_uncertain_state_and_keeps_refresh_button() {
+    val uncertainTx =
+      TxRecord(
+        id = "tx-uncertain-1",
+        network = Network.MAINNET,
+        accountRaw = "0:" + "11".repeat(32),
+        messageHash = "aa".repeat(32),
+        normalizedHash = "bb".repeat(32),
+        txHash = null,
+        seqno = 7,
+        direction = TxDirection.OUT,
+        kind = TxAssetKind.GRAM,
+        amount = Money.ofNano(1_500_000_000L),
+        fee = null,
+        counterpartyRaw = "0:" + "22".repeat(32),
+        comment = null,
+        state = TxStatus.UNCERTAIN,
+        validUntilEpochSec = 1_800_000_120L,
+        lt = null,
+        createdAtEpochMs = 1_700_000_000_000L,
+        updatedAtEpochMs = 1_700_000_150_000L,
+        errorDetail = "Sequence number advanced before message hash confirmation; verifying on TON",
+      )
+    composeTestRule.setContent {
+      GramVaultTheme {
+        SendStatusScreen(
+          txRecord = uncertainTx,
+          onRefreshStatus = {},
+          onDone = {},
+        )
+      }
+    }
+    composeTestRule.onNodeWithTag("send_status_badge").assertTextContains("Uncertain", substring = true)
+    composeTestRule.onNodeWithTag("send_status_refresh_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("send_done_button").assertIsDisplayed()
+  }
+
+  @Test
   fun send_ui_screens_render_destination_bounce_badge_and_status_correctly() {
-    val dest = TonAddress("0:" + "66".repeat(32), Network.TESTNET)
+    val dest = TonAddress("0:" + "66".repeat(32), Network.MAINNET)
     val preview =
       com.example.core.model.TransferPreview(
-        network = Network.TESTNET,
-        fromAddress = TonAddress("0:" + "55".repeat(32), Network.TESTNET),
-        destination = com.example.core.model.ParsedAddress(dest, isRaw = false, isBounceable = false, isTestnetOnly = true),
+        network = Network.MAINNET,
+        fromAddress = TonAddress("0:" + "55".repeat(32), Network.MAINNET),
+        destination = com.example.core.model.ParsedAddress(dest, isRaw = false, isBounceable = false, isTestnetOnly = false),
         destinationStatus = AccountOnChainStatus.UNINIT,
         effectiveBounce = false,
         amount = Money.ofNano(2_500_000_000L),
@@ -856,8 +1138,8 @@ class ExampleRobolectricTest {
     val tx =
       TxRecord(
         id = "tx-1",
-        network = Network.TESTNET,
-        accountRaw = metadata.testnetRaw,
+        network = Network.MAINNET,
+        accountRaw = metadata.mainnetRaw,
         messageHash = "aa".repeat(32),
         normalizedHash = "bb".repeat(32),
         txHash = "cc".repeat(32),
@@ -879,10 +1161,9 @@ class ExampleRobolectricTest {
       GramVaultTheme {
         WalletHomeScreen(
           metadata = metadata,
-          activeNetwork = Network.TESTNET,
+          activeNetwork = Network.MAINNET,
           bannerMessage = null,
           onClearBanner = {},
-          onSelectNetwork = {},
           onOpenBackup = {},
           onLockWallet = {},
           onOpenSend = { sendOpened = true },
@@ -900,7 +1181,7 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun metadata_store_persists_last_active_network_across_instances() {
+  fun metadata_store_normalizes_legacy_testnet_preference_to_mainnet() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     File(context.filesDir, "vault").deleteRecursively()
     val store1 = VaultMetadataStore(context)
@@ -914,11 +1195,8 @@ class ExampleRobolectricTest {
         lastActiveNetwork = Network.TESTNET,
       )
     store1.save(meta)
-    val store2 = VaultMetadataStore(context)
-    val reloaded = store2.load()
-    assertEquals(Network.TESTNET, reloaded?.lastActiveNetwork)
-    store2.save(meta.copy(lastActiveNetwork = Network.MAINNET))
-    assertEquals(Network.MAINNET, VaultMetadataStore(context).load()?.lastActiveNetwork)
+    val reloaded = VaultMetadataStore(context).load()
+    assertEquals(Network.MAINNET, reloaded?.lastActiveNetwork)
   }
 
   @Test
@@ -953,7 +1231,6 @@ class ExampleRobolectricTest {
           authGate = fakeAuth,
           secureKeyStore = keyStore,
           metadataStore = metaStore,
-          walletKitBridge = null,
           txManager = txManager,
           clockMs = { fakeNowMs },
         )
@@ -1247,7 +1524,7 @@ class ExampleRobolectricTest {
       val gateway = FakeChainGateway(db) { nowMs }
       gateway.senderStatus = AccountOnChainStatus.ACTIVE
       gateway.senderSeqno = 2
-      gateway.senderJettonWallet = TonAddress("0:" + "ab".repeat(32), Network.TESTNET)
+      gateway.senderJettonWallet = TonAddress("0:" + "ab".repeat(32), Network.MAINNET)
       gateway.senderUsdtBalance = Money.fromDecimalString("25.50", USDT_DECIMALS)
       gateway.senderBalance = Money.ofNano(40_000_000L) // less than 0.055 GRAM + fee
 
@@ -1264,14 +1541,13 @@ class ExampleRobolectricTest {
           authGate = fakeAuth,
           secureKeyStore = keyStore,
           metadataStore = metaStore,
-          walletKitBridge = null,
           txManager = txManager,
           clockMs = { nowMs },
         )
-      val created = core.createWallet(Network.TESTNET).getOrThrow()
+      val created = core.createWallet(Network.MAINNET).getOrThrow()
       created.mnemonic.wipe()
-      gateway.senderAddressRaw = created.testnetAddress.raw
-      val dest = TonAddress("0:" + "44".repeat(32), Network.TESTNET)
+      gateway.senderAddressRaw = created.mainnetAddress.raw
+      val dest = TonAddress("0:" + "44".repeat(32), Network.MAINNET)
 
       // 1. Insufficient GRAM for attached Jetton gas
       val gasShort =
@@ -1292,7 +1568,7 @@ class ExampleRobolectricTest {
       assertEquals(TxAssetKind.JETTON, preview.assetKind)
       assertEquals("USDT", preview.assetSymbol)
       assertEquals(Money.fromDecimalString("12.50", USDT_DECIMALS), preview.amount)
-      assertEquals(JettonAllowList.TESTNET_USDT.masterAddress.raw, preview.jettonMasterRaw)
+      assertEquals(JettonAllowList.MAINNET_USDT.masterAddress.raw, preview.jettonMasterRaw)
 
       val sent = core.confirmAndSend(preview).getOrThrow()
       assertEquals(TxStatus.BROADCASTED, sent.state)
@@ -1321,14 +1597,14 @@ class ExampleRobolectricTest {
             lt = "6002",
             utimeEpochSec = 1710000200L,
             direction = TxDirection.IN,
-            jettonMasterRaw = JettonAllowList.TESTNET_USDT.masterAddress.raw,
+            jettonMasterRaw = JettonAllowList.MAINNET_USDT.masterAddress.raw,
             amount = Money.fromDecimalString("5.25", USDT_DECIMALS),
             counterpartyRaw = dest.raw,
             comment = "Real USDT",
             status = OnChainMessageStatus.CONFIRMED,
           ),
         )
-      val jettonSync = txManager.syncAccountHistory(created.testnetAddress).getOrThrow()
+      val jettonSync = txManager.syncAccountHistory(created.mainnetAddress).getOrThrow()
       assertEquals(1, jettonSync.newIncomingTxs.size)
       assertEquals(TxAssetKind.JETTON, jettonSync.newIncomingTxs[0].kind)
       assertEquals("5.25", jettonSync.newIncomingTxs[0].amount.format())
@@ -1336,7 +1612,7 @@ class ExampleRobolectricTest {
       // 5. knownAccountLt <= latestLocalLt short-circuits redundant history calls when no pending txs
       db.txDao().markTerminal(sent.id, TxStatus.CONFIRMED.name, "outer_hash", "6000", "5000000", nowMs, null)
       gateway.historyCallCount = 0
-      val skippedSync = txManager.syncAccountHistory(created.testnetAddress, knownAccountLt = "6002").getOrThrow()
+      val skippedSync = txManager.syncAccountHistory(created.mainnetAddress, knownAccountLt = "6002").getOrThrow()
       assertEquals("Cache", skippedSync.providerName)
       assertEquals(0, gateway.historyCallCount)
     } finally {
@@ -1418,7 +1694,6 @@ class ExampleRobolectricTest {
           activeNetwork = Network.MAINNET,
           bannerMessage = null,
           onClearBanner = {},
-          onSelectNetwork = {},
           onOpenBackup = {},
           onLockWallet = {},
           balanceState = balanceState,
@@ -1436,17 +1711,17 @@ class ExampleRobolectricTest {
   @Test
   fun send_form_switches_gram_and_usdt_and_address_book_screen_saves_contact() {
     var selectedAsset = TxAssetKind.GRAM
-    val testnetBalance =
+    val mainnetBalance =
       BalanceState(
-        network = Network.TESTNET,
+        network = Network.MAINNET,
         gramBalance = Money.ofNano(5_000_000_000L),
         usdtBalance = Money.fromDecimalString("42.50", USDT_DECIMALS),
       )
     composeTestRule.setContent {
       GramVaultTheme {
         SendFormScreen(
-          activeNetwork = Network.TESTNET,
-          balanceState = testnetBalance,
+          activeNetwork = Network.MAINNET,
+          balanceState = mainnetBalance,
           recipientInput = "",
           amountInput = "",
           commentInput = "",
@@ -1505,6 +1780,140 @@ class ExampleRobolectricTest {
     assertEquals(sampleDest, savedAddress)
   }
 
+  @Test
+  fun usdt_transfer_ignores_wallet_hop_confirm_detects_downstream_bounce_and_confirms_only_on_complete_trace() =
+    runTest {
+      val context = ApplicationProvider.getApplicationContext<Context>()
+      File(context.filesDir, "vault").deleteRecursively()
+      val db =
+        Room.inMemoryDatabaseBuilder(context, GramVaultDatabase::class.java)
+          .allowMainThreadQueries()
+          .build()
+      try {
+        var nowMs = 1_710_000_000_000L
+        val fakeAuth = FakeAuthGate(deviceSecure = true, nextResult = AuthResult.Authenticated)
+        val fakeCipher = InMemoryAesCipherProvider().apply { isAuthenticated = true }
+        val keyStore = SecureKeyStore(context, fakeCipher)
+        val metaStore = VaultMetadataStore(context)
+
+        val dest = TonAddress("0:" + "44".repeat(32), Network.MAINNET)
+        val jettonWallet = TonAddress("0:" + "99".repeat(32), Network.MAINNET)
+        val gateway = FakeChainGateway(db = db, nowProvider = { nowMs })
+        gateway.walletStatuses[dest.raw] = AccountOnChainStatus.ACTIVE
+        gateway.senderBalance = Money.ofNano(5_000_000_000L)
+        gateway.senderStatus = AccountOnChainStatus.ACTIVE
+        gateway.senderSeqno = 5
+        gateway.senderJettonWallet = jettonWallet
+        gateway.senderUsdtBalance = Money.fromDecimalString("100.00", USDT_DECIMALS)
+
+        val txManager =
+          TxManager(
+            txDao = db.txDao(),
+            chainGateway = gateway,
+            clockMs = { nowMs },
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+          )
+        val core =
+          WalletCoreImpl(
+            applicationContext = context,
+            authGate = fakeAuth,
+            secureKeyStore = keyStore,
+            metadataStore = metaStore,
+            txManager = txManager,
+            clockMs = { nowMs },
+          )
+
+        val created = core.createWallet(Network.MAINNET).getOrThrow()
+        created.mnemonic.wipe()
+        gateway.senderAddressRaw = created.mainnetAddress.raw
+
+        // 1. Send USDT transfer -> BROADCASTED
+        val preview1 =
+          core.prepareTransfer(dest.toFriendly(true), "12.50", "Order 1", TxAssetKind.JETTON).getOrThrow()
+        val usdtTx1 = core.confirmAndSend(preview1).getOrThrow()
+        assertEquals(TxStatus.BROADCASTED, usdtTx1.state)
+
+        // Single-hop lookup & wallet account history report CONFIRMED, while full trace is still PENDING
+        gateway.nextLookup =
+          RemoteTxLookup(
+            status = OnChainMessageStatus.CONFIRMED,
+            txHash = "wallet_hop_hash_1",
+            lt = "7001",
+            fee = Money.ofNano(3_000_000L),
+            providerName = "TonAPI",
+          )
+        gateway.nextJettonTraceLookup =
+          RemoteTxLookup(
+            status = OnChainMessageStatus.PENDING,
+            txHash = "wallet_hop_hash_1",
+            lt = "7001",
+            fee = null,
+            providerName = "TonAPI",
+          )
+        gateway.historyTransfers =
+          listOf(
+            RemoteChainTransfer(
+              txHash = "wallet_hop_hash_1",
+              lt = "7001",
+              utimeEpochSec = 1_710_000_005L,
+              direction = TxDirection.OUT,
+              amount = Money.ofNano(55_000_000L),
+              fee = Money.ofNano(3_000_000L),
+              counterpartyRaw = jettonWallet.raw,
+              comment = null,
+              status = OnChainMessageStatus.CONFIRMED,
+              inMsgHash = usdtTx1.messageHash,
+              inMsgNormalizedHash = usdtTx1.normalizedHash,
+            )
+          )
+
+        txManager.syncAccountHistory(created.mainnetAddress).getOrThrow()
+        val afterWalletSync = core.refreshTransactionStatus(usdtTx1.id)!!
+        assertEquals(TxStatus.BROADCASTED, afterWalletSync.state)
+        assertEquals("wallet_hop_hash_1", afterWalletSync.txHash)
+
+        // 2. Downstream bounce/abort detected by full trace lookup -> FAILED (and resync does not overwrite)
+        gateway.nextJettonTraceLookup =
+          RemoteTxLookup(
+            status = OnChainMessageStatus.FAILED,
+            txHash = "wallet_hop_hash_1",
+            lt = "7001",
+            fee = Money.ofNano(8_500_000L),
+            providerName = "TON Center",
+            failureReason = "Jetton transfer failed or bounced back",
+          )
+        val bouncedTx = core.refreshTransactionStatus(usdtTx1.id)!!
+        assertEquals(TxStatus.FAILED, bouncedTx.state)
+
+        txManager.syncAccountHistory(created.mainnetAddress).getOrThrow()
+        assertEquals(TxStatus.FAILED.name, db.txDao().getById(usdtTx1.id)!!.state)
+
+        // 3. Complete non-bounced Jetton trace -> CONFIRMED
+        gateway.senderSeqno = 6
+        gateway.historyTransfers = emptyList()
+        gateway.nextJettonTraceLookup =
+          RemoteTxLookup(OnChainMessageStatus.PENDING, null, null, null, "TON Center")
+        val preview2 =
+          core.prepareTransfer(dest.toFriendly(true), "5.00", "Order 2", TxAssetKind.JETTON).getOrThrow()
+        val usdtTx2 = core.confirmAndSend(preview2).getOrThrow()
+        assertEquals(TxStatus.BROADCASTED, core.refreshTransactionStatus(usdtTx2.id)!!.state)
+
+        gateway.nextJettonTraceLookup =
+          RemoteTxLookup(
+            status = OnChainMessageStatus.CONFIRMED,
+            txHash = "wallet_hop_hash_2",
+            lt = "7050",
+            fee = Money.ofNano(11_000_000L),
+            providerName = "TON Center",
+          )
+        val confirmedUsdt = core.refreshTransactionStatus(usdtTx2.id)!!
+        assertEquals(TxStatus.CONFIRMED, confirmedUsdt.state)
+        assertEquals("wallet_hop_hash_2", confirmedUsdt.txHash)
+      } finally {
+        db.close()
+      }
+    }
+
   private class FakeChainGateway(
     private val db: GramVaultDatabase,
     private val nowProvider: () -> Long,
@@ -1522,6 +1931,8 @@ class ExampleRobolectricTest {
     var roomStateObservedDuringSendBoc: String? = null
     var bocObservedDuringSendBoc: String? = null
     var nextLookup: RemoteTxLookup =
+      RemoteTxLookup(OnChainMessageStatus.PENDING, null, null, null, "TonAPI")
+    var nextJettonTraceLookup: RemoteTxLookup =
       RemoteTxLookup(OnChainMessageStatus.PENDING, null, null, null, "TonAPI")
     var historyTransfers: List<RemoteChainTransfer> = emptyList()
     var jettonHistoryTransfers: List<RemoteJettonTransfer> = emptyList()
@@ -1577,6 +1988,12 @@ class ExampleRobolectricTest {
       messageHashHex: String,
       normalizedHashHex: String,
     ) = Result.success(nextLookup)
+
+    override suspend fun lookupJettonTraceStatus(
+      network: Network,
+      messageHashHex: String,
+      normalizedHashHex: String,
+    ) = Result.success(nextJettonTraceLookup)
 
     override suspend fun fetchAccountHistory(
       address: TonAddress,

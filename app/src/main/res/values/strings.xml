@@ -1,8 +1,6 @@
 <resources>
     <string name="app_name">GramVault</string>
     <string name="network_mainnet">Mainnet</string>
-    <string name="network_testnet">Testnet</string>
-    <string name="testnet_active_warning">TESTNET MODE • Test coins only</string>
     <string name="wallet_badge_v5r1">V5R1 Wallet</string>
     <string name="wallet_badge_format">%1$s Wallet</string>
     <string name="wallet_creating">Securing your V5R1 wallet...</string>
@@ -22,7 +20,6 @@
     <string name="address_copied">Address copied</string>
     <string name="receive_sheet_title">Receive GRAM &amp; USDT</string>
     <string name="receive_mainnet_note">Send only TON network assets (GRAM or USDT) to this Mainnet address.</string>
-    <string name="receive_testnet_note">Testnet address only. Do not send real Mainnet GRAM or USDT here.</string>
     <string name="receive_base64_label">Base64 Address (Non-bounceable)</string>
     <string name="receive_raw_label">Raw Address</string>
     <string name="action_copy_raw">Copy Raw</string>
@@ -37,7 +34,7 @@
     <string name="receive_uri_label">TON Transfer Link (ton://transfer/)</string>
     <string name="receive_checker_toggle">Verify Any Address or Link</string>
     <string name="receive_checker_label">Paste TON address or ton://transfer/ link</string>
-    <string name="receive_checker_hint">UQ... / 0Q... / 0:... / ton://transfer/...</string>
+    <string name="receive_checker_hint">UQ... / EQ... / 0:... / ton://transfer/...</string>
     <string name="receive_checker_valid_format">Valid %1$s address (%2$s)</string>
     <string name="receive_checker_raw_type">Raw workchain:hash</string>
     <string name="receive_checker_friendly_bounceable">Friendly • Bounceable</string>
@@ -54,16 +51,15 @@
     <string name="core_status_title">Vault Security Status</string>
     <string name="core_status_body">Hardware AES-256-GCM Keystore, V3R1–V5R1 import, multi-provider cached GRAM balance, and verified ton://transfer/ Receive + address validator active.</string>
     <string name="wallet_error_title">Vault operation failed</string>
-    <string name="switch_network_cd">Switch network between Mainnet and Testnet</string>
 
     <string name="welcome_title">Non-Custodial TON Vault</string>
     <string name="welcome_subtitle">Create a V5R1 wallet or import a 12/24-word TON recovery phrase. Private keys stay encrypted in device hardware and never leave this phone.</string>
     <string name="welcome_security_point_1">12-word BIP-39 recovery phrase with m/44\u2019/607\u2019/0\u2019 derivation</string>
     <string name="welcome_security_point_2">Protected by biometrics or device PIN/pattern</string>
-    <string name="welcome_security_point_3">Separate Mainnet and Testnet V5R1 wallet IDs</string>
+    <string name="welcome_security_point_3">Mainnet V5R1 non-custodial security</string>
     <string name="welcome_create_button">Create New Wallet</string>
     <string name="welcome_import_button">Import Existing Wallet</string>
-    <string name="welcome_pin_fallback_note">No system screen lock detected. You will set a dedicated 4–8 digit Vault PIN layered with Android Keystore encryption.</string>
+    <string name="welcome_pin_fallback_note">No system screen lock detected. Enabling a device lock screen is recommended; fallback uses a 6\u20138 digit Vault PIN with attempt lockout and Keystore encryption.</string>
 
     <string name="import_title">Import Wallet</string>
     <string name="import_subtitle">Enter your 12-word Multichain or 24-word TON / Multichain recovery phrase separated by spaces. Screenshots are blocked.</string>
@@ -79,16 +75,15 @@
     <string name="import_scheme_ton_legacy">TON Standard (24-word)</string>
     <string name="import_confirm_button">Import Selected Account</string>
     <string name="import_mainnet_label">Mainnet:</string>
-    <string name="import_testnet_label">Testnet:</string>
 
     <string name="pin_setup_title">Set Vault PIN</string>
-    <string name="pin_setup_subtitle">Enter a 4–8 digit PIN to encrypt your wallet key with hardware Keystore.</string>
+    <string name="pin_setup_subtitle">Enter a 6–8 digit PIN to encrypt your wallet key with hardware Keystore.</string>
     <string name="pin_enter_title">Enter Vault PIN</string>
-    <string name="pin_enter_subtitle">Enter your 4–8 digit Vault PIN to continue.</string>
-    <string name="pin_field_label">Vault PIN (4–8 digits)</string>
+    <string name="pin_enter_subtitle">Enter your 6–8 digit Vault PIN to continue.</string>
+    <string name="pin_field_label">Vault PIN (6–8 digits)</string>
     <string name="pin_confirm_field_label">Confirm Vault PIN</string>
     <string name="pin_mismatch_error">PINs do not match</string>
-    <string name="pin_length_error">Enter 4 to 8 digits</string>
+    <string name="pin_length_error">Enter 6 to 8 digits</string>
     <string name="pin_confirm_button">Continue</string>
     <string name="pin_cancel_button">Cancel</string>
 
@@ -157,6 +152,7 @@
     <string name="send_status_title">Transfer Status</string>
     <string name="send_status_signed">Signed • Queued for Broadcast</string>
     <string name="send_status_broadcasted">Broadcasted • Waiting for Block</string>
+    <string name="send_status_uncertain">Uncertain • Verifying on TON</string>
     <string name="send_status_confirmed">Confirmed on TON</string>
     <string name="send_status_failed">Transfer Failed</string>
     <string name="send_status_expired">Transfer Expired</string>

@@ -402,11 +402,6 @@ private fun CandidateAccountCard(
         style = MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMonoFontFamily),
         color = MaterialTheme.colorScheme.onSurface,
       )
-      Text(
-        text = "${stringResource(R.string.import_testnet_label)} ${shortPreview(candidate.testnetAddress.toFriendly(bounceable = false))}",
-        style = MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMonoFontFamily),
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-      )
     }
   }
 }

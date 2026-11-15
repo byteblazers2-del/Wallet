@@ -154,13 +154,9 @@ fun ReceiveSheetContent(
       modifier = Modifier.fillMaxWidth(),
     )
     Text(
-      text =
-        if (network == Network.MAINNET) stringResource(R.string.receive_mainnet_note)
-        else stringResource(R.string.receive_testnet_note),
+      text = stringResource(R.string.receive_mainnet_note),
       style = MaterialTheme.typography.bodySmall,
-      color =
-        if (network == Network.MAINNET) MaterialTheme.colorScheme.onSurfaceVariant
-        else Color(0xFFFF8A80),
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
       modifier = Modifier.fillMaxWidth(),
     )
 
@@ -407,10 +403,7 @@ fun ReceiveSheetContent(
             )
             if (checkerInput.isNotBlank()) {
               val checkResult = remember(checkerInput, network) { onValidateInput(checkerInput) }
-              AddressCheckResultCard(
-                result = checkResult,
-                network = network,
-              )
+              AddressCheckResultCard(result = checkResult)
             }
           }
         }
@@ -424,7 +417,6 @@ fun ReceiveSheetContent(
 @Composable
 private fun AddressCheckResultCard(
   result: AddressCheckResult,
-  network: Network,
 ) {
   when (result) {
     is AddressCheckResult.Valid -> {
@@ -435,9 +427,7 @@ private fun AddressCheckResultCard(
           parsed.isBounceable -> stringResource(R.string.receive_checker_friendly_bounceable)
           else -> stringResource(R.string.receive_checker_friendly_nonbounceable)
         }
-      val netLabel =
-        if (network == Network.MAINNET) stringResource(R.string.network_mainnet)
-        else stringResource(R.string.network_testnet)
+      val netLabel = stringResource(R.string.network_mainnet)
       Surface(
         shape = RoundedCornerShape(14.dp),
         color = Color(0xFF132D22),

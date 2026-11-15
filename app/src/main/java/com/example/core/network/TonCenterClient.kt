@@ -210,6 +210,29 @@ class TonCenterClient(
       )
     }
 
+  override suspend fun lookupJettonTraceStatus(
+    network: Network,
+    messageHashHex: String,
+    normalizedHashHex: String,
+  ): RemoteTxLookup =
+    withContext(Dispatchers.IO) {
+      val baseUrl = endpoints.baseUrlFor(network).trimEnd('/')
+      val firstTrace = queryJettonTraceByMessage(baseUrl, normalizedHashHex)
+      if (firstTrace != null) return@withContext firstTrace
+      if (messageHashHex.isNotBlank() && messageHashHex != normalizedHashHex) {
+        requestPacer(name)
+        val secondTrace = queryJettonTraceByMessage(baseUrl, messageHashHex)
+        if (secondTrace != null) return@withContext secondTrace
+      }
+      RemoteTxLookup(
+        status = OnChainMessageStatus.PENDING,
+        txHash = null,
+        lt = null,
+        fee = null,
+        providerName = name,
+      )
+    }
+
   override suspend fun fetchAccountHistory(
     address: TonAddress,
     afterLt: String?,
@@ -385,6 +408,292 @@ class TonCenterClient(
       providerName = name,
       failureReason = if (status == OnChainMessageStatus.FAILED) "Transaction aborted on-chain" else null,
     )
+  }
+
+  private class TonCenterTraceEval {
+    var rootTxHash: String? = null
+    var rootLt: String? = null
+    var startLt: String? = null
+    var isIncomplete: Boolean = false
+    var hasFailureOrBounce: Boolean = false
+    var hasActionFailure: Boolean = false
+    var hasSuccessfulJettonAction: Boolean = false
+    var totalFeesNano: BigInteger = BigInteger.ZERO
+    var hasFee: Boolean = false
+    val seenTxKeys = mutableSetOf<String>()
+  }
+
+  private fun queryJettonTraceByMessage(baseUrl: String, hashHex: String): RemoteTxLookup? {
+    val cleanHex = hashHex.removePrefix("0x").trim()
+    if (cleanHex.isEmpty()) return null
+    val encodedHash = URLEncoder.encode(cleanHex, StandardCharsets.UTF_8.name())
+    val bodyBytes =
+      executeGetAllow404(
+        "$baseUrl/api/v3/traces?msg_hash=$encodedHash&include_actions=true&limit=1"
+      )
+        ?: return null
+    if (bodyBytes.isEmpty()) return null
+    return try {
+      val reader = JsonReader.of(Buffer().write(bodyBytes))
+      if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+        throw InvalidPayloadException(name, "Expected JSON object")
+      }
+      val eval = TonCenterTraceEval()
+      var foundTrace = false
+      reader.beginObject()
+      while (reader.hasNext()) {
+        when (reader.nextName()) {
+          "traces" -> {
+            if (reader.peek() == JsonReader.Token.BEGIN_ARRAY) {
+              reader.beginArray()
+              if (reader.hasNext()) {
+                foundTrace = true
+                parseTonCenterTraceEntry(reader, eval)
+              }
+              while (reader.hasNext()) reader.skipValue()
+              reader.endArray()
+            } else {
+              reader.skipValue()
+            }
+          }
+          "transactions" -> readTonCenterTraceTransactionsMap(reader, eval)
+          else -> reader.skipValue()
+        }
+      }
+      reader.endObject()
+
+      if (!foundTrace) return null
+      val effectiveFee = if (eval.hasFee) Money(eval.totalFeesNano, GRAM_DECIMALS) else null
+      val effectiveLt = eval.rootLt ?: eval.startLt
+      when {
+        eval.hasFailureOrBounce || eval.hasActionFailure ->
+          RemoteTxLookup(
+            status = OnChainMessageStatus.FAILED,
+            txHash = eval.rootTxHash,
+            lt = effectiveLt,
+            fee = effectiveFee,
+            providerName = name,
+            failureReason = "Jetton transfer failed or bounced back",
+          )
+        eval.isIncomplete || (eval.seenTxKeys.size < 2 && !eval.hasSuccessfulJettonAction) ->
+          RemoteTxLookup(
+            status = OnChainMessageStatus.PENDING,
+            txHash = eval.rootTxHash,
+            lt = effectiveLt,
+            fee = null,
+            providerName = name,
+          )
+        else ->
+          RemoteTxLookup(
+            status = OnChainMessageStatus.CONFIRMED,
+            txHash = eval.rootTxHash,
+            lt = effectiveLt,
+            fee = effectiveFee,
+            providerName = name,
+          )
+      }
+    } catch (e: ProviderException) {
+      throw e
+    } catch (e: Exception) {
+      throw InvalidPayloadException(name, "Malformed traces JSON", e)
+    }
+  }
+
+  private fun parseTonCenterTraceEntry(reader: JsonReader, eval: TonCenterTraceEval) {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return
+    }
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "trace_id" -> {
+          val tid = readScalarAsStringOrSkip(reader)?.takeIf { it.isNotBlank() }
+          if (eval.rootTxHash == null) eval.rootTxHash = tid
+        }
+        "start_lt" -> eval.startLt = readScalarAsStringOrSkip(reader)?.takeIf { it.isNotBlank() }
+        "is_incomplete" -> eval.isIncomplete = readBooleanOrNull(reader) ?: false
+        "transactions" -> readTonCenterTraceTransactionsMap(reader, eval)
+        "actions" -> readTonCenterTraceActions(reader, eval)
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+  }
+
+  private fun readTonCenterTraceTransactionsMap(reader: JsonReader, eval: TonCenterTraceEval) {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return
+    }
+    reader.beginObject()
+    while (reader.hasNext()) {
+      val mapKey = reader.nextName()
+      readTonCenterTraceTransaction(reader, mapKey, eval)
+    }
+    reader.endObject()
+  }
+
+  private fun readTonCenterTraceTransaction(
+    reader: JsonReader,
+    mapKey: String,
+    eval: TonCenterTraceEval,
+  ) {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return
+    }
+    var txHash: String? = mapKey.takeIf { it.isNotBlank() }
+    var lt: String? = null
+    var feeNano: BigInteger? = null
+    var aborted = false
+    var computeFailed = false
+    var actionFailed = false
+    var bounceExecuted = false
+    var inBounced = false
+    var outBounced = false
+
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "hash" -> txHash = readScalarAsStringOrSkip(reader)?.takeIf { it.isNotBlank() } ?: txHash
+        "lt" -> lt = readScalarAsStringOrSkip(reader)?.takeIf { it.isNotBlank() }
+        "total_fees",
+        "total_fee" ->
+          feeNano = readScalarAsStringOrSkip(reader)?.trim()?.toBigIntegerOrNull() ?: feeNano
+        "aborted" -> if (readBooleanOrNull(reader) == true) aborted = true
+        "bounce" -> if (readTonCenterBounceType(reader) == "ok") bounceExecuted = true
+        "compute_ph" ->
+          applyTonCenterComputePhase(
+            reader = reader,
+            onSkippedNoState = {},
+            onFailure = { computeFailed = true },
+          )
+        "action" -> if (readTonCenterActionPhaseFailed(reader)) actionFailed = true
+        "description" -> {
+          if (reader.peek() == JsonReader.Token.BEGIN_OBJECT) {
+            reader.beginObject()
+            while (reader.hasNext()) {
+              when (reader.nextName()) {
+                "aborted" -> if (readBooleanOrNull(reader) == true) aborted = true
+                "bounce" -> if (readTonCenterBounceType(reader) == "ok") bounceExecuted = true
+                "compute_ph" ->
+                  applyTonCenterComputePhase(
+                    reader = reader,
+                    onSkippedNoState = {},
+                    onFailure = { computeFailed = true },
+                  )
+                "action" -> if (readTonCenterActionPhaseFailed(reader)) actionFailed = true
+                else -> reader.skipValue()
+              }
+            }
+            reader.endObject()
+          } else {
+            reader.skipValue()
+          }
+        }
+        "in_msg" -> if (readTonCenterMsgBounced(reader)) inBounced = true
+        "out_msgs" -> {
+          if (reader.peek() == JsonReader.Token.BEGIN_ARRAY) {
+            reader.beginArray()
+            while (reader.hasNext()) {
+              if (readTonCenterMsgBounced(reader)) outBounced = true
+            }
+            reader.endArray()
+          } else {
+            reader.skipValue()
+          }
+        }
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+
+    val dedupKey = txHash ?: mapKey
+    if (!eval.seenTxKeys.add(dedupKey)) return
+    if (eval.seenTxKeys.size == 1) {
+      if (txHash != null) eval.rootTxHash = txHash
+      if (lt != null) eval.rootLt = lt
+    }
+    if (feeNano != null) {
+      eval.totalFeesNano = eval.totalFeesNano.add(feeNano)
+      eval.hasFee = true
+    }
+    if (aborted || computeFailed || actionFailed || bounceExecuted || inBounced || outBounced) {
+      eval.hasFailureOrBounce = true
+    }
+  }
+
+  private fun readTonCenterActionPhaseFailed(reader: JsonReader): Boolean {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return false
+    }
+    var failed = false
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "success" -> if (readBooleanOrNull(reader) == false) failed = true
+        "result_code" -> {
+          val code = readScalarAsStringOrSkip(reader)?.toIntOrNull()
+          if (code != null && code != 0) failed = true
+        }
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+    return failed
+  }
+
+  private fun readTonCenterMsgBounced(reader: JsonReader): Boolean {
+    if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+      reader.skipValue()
+      return false
+    }
+    var bounced = false
+    reader.beginObject()
+    while (reader.hasNext()) {
+      when (reader.nextName()) {
+        "bounced" -> if (readBooleanOrNull(reader) == true) bounced = true
+        else -> reader.skipValue()
+      }
+    }
+    reader.endObject()
+    return bounced
+  }
+
+  private fun readTonCenterTraceActions(reader: JsonReader, eval: TonCenterTraceEval) {
+    if (reader.peek() != JsonReader.Token.BEGIN_ARRAY) {
+      reader.skipValue()
+      return
+    }
+    reader.beginArray()
+    while (reader.hasNext()) {
+      if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+        reader.skipValue()
+        continue
+      }
+      var actionType: String? = null
+      var actionSuccess: Boolean? = null
+      reader.beginObject()
+      while (reader.hasNext()) {
+        when (reader.nextName()) {
+          "type" -> actionType = readScalarAsStringOrSkip(reader)
+          "success" -> actionSuccess = readBooleanOrNull(reader)
+          else -> reader.skipValue()
+        }
+      }
+      reader.endObject()
+      if (actionSuccess == false) {
+        eval.hasActionFailure = true
+      } else if (
+        actionSuccess == true &&
+          actionType.equals("jetton_transfer", ignoreCase = true)
+      ) {
+        eval.hasSuccessfulJettonAction = true
+      }
+    }
+    reader.endArray()
   }
 
   private fun parseAccountHistoryJson(

@@ -53,6 +53,15 @@ class ProviderRouter(
       provider.lookupMessageStatus(network, messageHashHex, normalizedHashHex)
     }
 
+  override suspend fun lookupJettonTraceStatus(
+    network: Network,
+    messageHashHex: String,
+    normalizedHashHex: String,
+  ): Result<RemoteTxLookup> =
+    executeWithFailover { provider ->
+      provider.lookupJettonTraceStatus(network, messageHashHex, normalizedHashHex)
+    }
+
   override suspend fun fetchAccountHistory(
     address: TonAddress,
     afterLt: String?,

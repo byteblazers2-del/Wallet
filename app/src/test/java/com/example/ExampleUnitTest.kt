@@ -42,13 +42,6 @@ import org.ton.kotlin.cell.CellContext
 import org.ton.kotlin.crypto.PrivateKeyEd25519
 import org.ton.tlb.CellRef
 import org.ton.tlb.TlbCodec
-import io.ton.walletkit.api.MAINNET
-import io.ton.walletkit.api.TESTNET
-import io.ton.walletkit.api.generated.TONNetwork
-import io.ton.walletkit.api.isMainnet
-import io.ton.walletkit.api.isTestnet
-import io.ton.walletkit.model.TONRawAddress
-import io.ton.walletkit.model.TONUserFriendlyAddress
 import java.math.BigInteger
 import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicInteger
@@ -73,28 +66,23 @@ class ExampleUnitTest {
     assertNotEquals(Network.MAINNET.v5r1WalletId, Network.TESTNET.v5r1WalletId)
     assertEquals(0x7FFFFF11L, Network.MAINNET.v5r1WalletId)
     assertEquals(0x7FFFFFFDL, Network.TESTNET.v5r1WalletId)
-    assertNotEquals(TONNetwork.MAINNET.chainId, TONNetwork.TESTNET.chainId)
-    assertTrue(TONNetwork.TESTNET.isTestnet)
-    assertFalse(TONNetwork.TESTNET.isMainnet)
-    assertTrue(TONNetwork.MAINNET.isMainnet)
   }
 
   @Test
-  fun walletkit_address_resolution_and_wrong_network_rejection() {
+  fun address_resolution_and_wrong_network_rejection() {
     val rawHex = "0:0000000000000000000000000000000000000000000000000000000000000000"
-    val raw = TONRawAddress(rawHex)
-    val testnetFriendly = TONUserFriendlyAddress(raw, isBounceable = false, isTestnetOnly = true)
-    val mainnetFriendly = TONUserFriendlyAddress(raw, isBounceable = false, isTestnetOnly = false)
-    assertTrue(testnetFriendly.value.startsWith("0Q"))
-    assertTrue(mainnetFriendly.value.startsWith("UQ"))
+    val testnetFriendly = TonAddress(rawHex, Network.TESTNET).toFriendly(bounceable = false)
+    val mainnetFriendly = TonAddress(rawHex, Network.MAINNET).toFriendly(bounceable = false)
+    assertTrue(testnetFriendly.startsWith("0Q"))
+    assertTrue(mainnetFriendly.startsWith("UQ"))
 
-    val parsedMain = TonAddress.parse(mainnetFriendly.value, Network.MAINNET).getOrThrow()
-    assertEquals(mainnetFriendly.value, parsedMain.toFriendly(bounceable = false))
+    val parsedMain = TonAddress.parse(mainnetFriendly, Network.MAINNET).getOrThrow()
+    assertEquals(mainnetFriendly, parsedMain.toFriendly(bounceable = false))
     assertEquals(rawHex, parsedMain.raw)
 
-    assertTrue(TonAddress.parse(testnetFriendly.value, Network.MAINNET).isFailure)
-    assertTrue(TonAddress.parse(mainnetFriendly.value, Network.TESTNET).isFailure)
-    assertTrue(TonAddress.parse("${testnetFriendly.value.dropLast(1)}A", Network.TESTNET).isFailure)
+    assertTrue(TonAddress.parse(testnetFriendly, Network.MAINNET).isFailure)
+    assertTrue(TonAddress.parse(mainnetFriendly, Network.TESTNET).isFailure)
+    assertTrue(TonAddress.parse("${testnetFriendly.dropLast(1)}A", Network.TESTNET).isFailure)
   }
 
   @Test
@@ -1518,5 +1506,180 @@ class ExampleUnitTest {
 
     val sent = router.sendBoc(Network.TESTNET, "dGVzdA==").getOrThrow()
     assertEquals("TonAPI", sent.providerName)
+  }
+
+  @Test
+  fun toncenter_lookup_jetton_trace_requires_complete_non_bounced_trace() = runTest {
+    var payload = ""
+    val client =
+      TonCenterClient(
+        okHttpClient = mockHttpClient { jsonResponse(200, payload) },
+      )
+    val hash = "aa".repeat(32)
+
+    // 1. Incomplete trace -> PENDING
+    payload =
+      """
+      {
+        "traces": [
+          {
+            "trace_id": "t1",
+            "is_incomplete": true,
+            "transactions": {
+              "h1": {"hash": "h1", "lt": "100", "total_fees": "2000000", "aborted": false}
+            },
+            "actions": []
+          }
+        ]
+      }
+      """.trimIndent()
+    assertEquals(OnChainMessageStatus.PENDING, client.lookupJettonTraceStatus(Network.MAINNET, hash, hash).status)
+
+    // 2. Single-hop only without Jetton completion -> PENDING
+    payload =
+      """
+      {
+        "traces": [
+          {
+            "trace_id": "t1",
+            "is_incomplete": false,
+            "transactions": {
+              "h1": {"hash": "h1", "lt": "100", "total_fees": "2000000", "aborted": false}
+            },
+            "actions": []
+          }
+        ]
+      }
+      """.trimIndent()
+    assertEquals(OnChainMessageStatus.PENDING, client.lookupJettonTraceStatus(Network.MAINNET, hash, hash).status)
+
+    // 3. Downstream bounce on child Jetton wallet -> FAILED
+    payload =
+      """
+      {
+        "traces": [
+          {
+            "trace_id": "t1",
+            "is_incomplete": false,
+            "transactions": {
+              "h1": {"hash": "h1", "lt": "100", "total_fees": "2000000", "aborted": false},
+              "h2": {
+                "hash": "h2",
+                "lt": "101",
+                "total_fees": "3000000",
+                "description": {"aborted": false, "bounce": {"type": "ok"}},
+                "out_msgs": [{"bounced": true}]
+              }
+            },
+            "actions": [{"type": "jetton_transfer", "success": false}]
+          }
+        ]
+      }
+      """.trimIndent()
+    val bounced = client.lookupJettonTraceStatus(Network.MAINNET, hash, hash)
+    assertEquals(OnChainMessageStatus.FAILED, bounced.status)
+
+    // 4. Complete multi-hop non-bounced trace -> CONFIRMED with summed fees
+    payload =
+      """
+      {
+        "traces": [
+          {
+            "trace_id": "t1",
+            "is_incomplete": false,
+            "transactions": {
+              "h1": {"hash": "h1", "lt": "100", "total_fees": "2000000", "aborted": false, "out_msgs": [{"bounced": false}]},
+              "h2": {"hash": "h2", "lt": "101", "total_fees": "3000000", "aborted": false, "out_msgs": [{"bounced": false}]},
+              "h3": {"hash": "h3", "lt": "102", "total_fees": "2500000", "aborted": false, "out_msgs": []}
+            },
+            "actions": [{"type": "jetton_transfer", "success": true}]
+          }
+        ]
+      }
+      """.trimIndent()
+    val confirmed = client.lookupJettonTraceStatus(Network.MAINNET, hash, hash)
+    assertEquals(OnChainMessageStatus.CONFIRMED, confirmed.status)
+    assertEquals("h1", confirmed.txHash)
+    assertEquals(7_500_000L, confirmed.fee?.units?.toLong())
+  }
+
+  @Test
+  fun tonapi_lookup_jetton_trace_detects_child_bounce_and_in_progress_event() = runTest {
+    val rootHash = "root_tx_01"
+    var traceJson = ""
+    var eventJson = """{"in_progress":false,"actions":[{"type":"JettonTransfer","status":"ok"}]}"""
+    val client =
+      TonApiClient(
+        okHttpClient =
+          mockHttpClient {
+            val path = request().url.encodedPath
+            when {
+              path.endsWith("/transaction") ->
+                jsonResponse(200, """{"hash":"$rootHash","lt":"500","total_fees":2000000,"aborted":false,"success":true}""")
+              path == "/v2/traces/$rootHash" -> jsonResponse(200, traceJson)
+              path == "/v2/events/$rootHash" -> jsonResponse(200, eventJson)
+              else -> jsonResponse(404, """{}""")
+            }
+          },
+      )
+    val msgHash = "bb".repeat(32)
+
+    // 1. Only wallet node so far (no children) -> PENDING
+    traceJson = """{"in_progress":false,"transaction":{"hash":"$rootHash","lt":"500","total_fees":2000000,"aborted":false,"success":true},"children":[]}"""
+    assertEquals(OnChainMessageStatus.PENDING, client.lookupJettonTraceStatus(Network.MAINNET, msgHash, msgHash).status)
+
+    // 2. Child bounced internal transfer -> FAILED
+    traceJson =
+      """
+      {
+        "in_progress": false,
+        "transaction": {"hash": "$rootHash", "lt": "500", "total_fees": 2000000, "aborted": false, "success": true},
+        "children": [
+          {
+            "transaction": {
+              "hash": "jw_tx_02",
+              "lt": "501",
+              "total_fees": 3500000,
+              "aborted": true,
+              "compute_phase": {"skipped": false, "success": false, "exit_code": 706},
+              "out_msgs": [{"bounced": true}]
+            },
+            "children": []
+          }
+        ]
+      }
+      """.trimIndent()
+    assertEquals(OnChainMessageStatus.FAILED, client.lookupJettonTraceStatus(Network.MAINNET, msgHash, msgHash).status)
+
+    // 3. Multi-hop trace ready, event still in_progress -> PENDING
+    traceJson =
+      """
+      {
+        "in_progress": false,
+        "transaction": {"hash": "$rootHash", "lt": "500", "total_fees": 2000000, "aborted": false, "success": true},
+        "children": [
+          {
+            "transaction": {
+              "hash": "jw_tx_02",
+              "lt": "501",
+              "total_fees": 3500000,
+              "aborted": false,
+              "success": true,
+              "compute_phase": {"skipped": false, "success": true, "exit_code": 0},
+              "action_phase": {"success": true, "result_code": 0}
+            },
+            "children": []
+          }
+        ]
+      }
+      """.trimIndent()
+    eventJson = """{"in_progress":true,"actions":[{"type":"JettonTransfer","status":"ok"}]}"""
+    assertEquals(OnChainMessageStatus.PENDING, client.lookupJettonTraceStatus(Network.MAINNET, msgHash, msgHash).status)
+
+    // 4. Both trace and event finalized with no bounce/abort -> CONFIRMED
+    eventJson = """{"in_progress":false,"actions":[{"type":"JettonTransfer","status":"ok"}]}"""
+    val confirmed = client.lookupJettonTraceStatus(Network.MAINNET, msgHash, msgHash)
+    assertEquals(OnChainMessageStatus.CONFIRMED, confirmed.status)
+    assertEquals(5_500_000L, confirmed.fee?.units?.toLong())
   }
 }
